@@ -7,7 +7,11 @@ export const VAD_CDN_CONFIG = {
 
 export const VAD_DEFAULT_OPTIONS: VADOptions = {
   startOnLoad: false,
-  positiveSpeechThreshold: 0.8,
-  negativeSpeechThreshold: 0.35,
+  positiveSpeechThreshold: parseFloat(
+    process.env.NEXT_PUBLIC_VAD_POSITIVE_THRESHOLD || "0.8"
+  ),
+  negativeSpeechThreshold: parseFloat(
+    process.env.NEXT_PUBLIC_VAD_NEGATIVE_THRESHOLD || "0.35"
+  ),
   ...VAD_CDN_CONFIG,
 };

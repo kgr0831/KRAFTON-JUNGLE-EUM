@@ -27,6 +27,6 @@ export interface VADCallbacks {
 export interface SpeechLogEntry {
   id: string;
   timestamp: string;
-  type: "start" | "end" | "error";
+  type: "start" | "end" | "error" | "info";
   message: string;
 }

@@ -31,6 +31,13 @@ export const AUDIO_PROCESSING_CONFIG = {
   gainValue: 1.2,
 };
 
-export const AUDIO_SAMPLE_RATE = 16000;
+export const AUDIO_SAMPLE_RATE = parseInt(
+  process.env.NEXT_PUBLIC_AUDIO_SAMPLE_RATE || "16000",
+  10
+);
 
 export const SPEECH_LOG_MAX_ENTRIES = 10;
+
+// WebSocket 서버 URL
+export const WS_AUDIO_URL =
+  process.env.NEXT_PUBLIC_WS_URL || "ws://localhost:8080/ws/audio";

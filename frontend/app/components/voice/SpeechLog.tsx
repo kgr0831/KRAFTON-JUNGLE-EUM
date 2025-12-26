@@ -8,6 +8,7 @@ const typeIcons: Record<SpeechLogEntry["type"], string> = {
   start: "🎤",
   end: "🔊",
   error: "❌",
+  info: "ℹ️",
 };
 
 export function SpeechLog({ entries }: SpeechLogProps) {

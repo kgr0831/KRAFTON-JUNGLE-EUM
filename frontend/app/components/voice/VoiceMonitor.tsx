@@ -3,6 +3,7 @@
 import { useVoiceActivity } from "@/app/hooks";
 import { Button, StatusIndicator, AudioLevelBar } from "@/app/components/ui";
 import { SpeechLog } from "./SpeechLog";
+import type { ConnectionState } from "@/app/services/audioSocket";
 
 type VADStatus = "idle" | "listening" | "speaking" | "loading" | "error";
 
@@ -19,15 +20,38 @@ function getVADStatus(vad: {
   return "listening";
 }
 
+function getConnectionBadge(state: ConnectionState) {
+  const styles: Record<ConnectionState, string> = {
+    connected: "bg-green-500",
+    connecting: "bg-yellow-500 animate-pulse",
+    disconnected: "bg-gray-400",
+    error: "bg-red-500",
+  };
+  const labels: Record<ConnectionState, string> = {
+    connected: "서버 연결됨",
+    connecting: "연결 중...",
+    disconnected: "연결 안됨",
+    error: "연결 오류",
+  };
+  return (
+    <div className="flex items-center gap-2 text-sm">
+      <span className={`w-2 h-2 rounded-full ${styles[state]}`} />
+      <span className="text-zinc-600 dark:text-zinc-400">{labels[state]}</span>
+    </div>
+  );
+}
+
 export function VoiceMonitor() {
-  const vad = useVoiceActivity({ autoPlayback: true });
+  const vad = useVoiceActivity({ autoPlayback: true, useEchoServer: true });
   const status = getVADStatus(vad);
 
   return (
     <div className="flex flex-col items-center gap-6 p-8 w-full max-w-md">
       <h2 className="text-2xl font-bold text-zinc-900 dark:text-zinc-100">
-        Silero VAD + RNNoise
+        Echo Test
       </h2>
+
+      {getConnectionBadge(vad.connectionState)}
 
       <StatusIndicator status={status} />
 
@@ -57,7 +81,7 @@ export function VoiceMonitor() {
       )}
 
       <div className="text-sm text-zinc-500 dark:text-zinc-400 text-center space-y-1">
-        <p>마이크 권한을 허용하면 Silero VAD가 음성을 감지합니다.</p>
+        <p>음성 감지 → 서버 전송 → 에코 재생</p>
         <p>RNNoise + DSP 자동 적용</p>
       </div>
 
