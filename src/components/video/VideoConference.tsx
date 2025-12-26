@@ -5,7 +5,7 @@ import { Badge } from '../ui/badge';
 import { 
     Mic, MicOff, Video, VideoOff, PhoneOff, 
     MoreVertical, Settings, Volume2, VolumeX, 
-    Layout, Grid, Monitor, Languages, Hand
+    Layout, Grid, Monitor, Languages, Hand, ScreenShare
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { MiroWhiteboard } from '../whiteboard/MiroWhiteboard';
@@ -45,6 +45,7 @@ export function VideoConference({ onLeave, toggleChat, isChatOpen }: VideoConfer
     // Call States
     const [isMyMicOn, setIsMyMicOn] = useState(false);
     const [isMyVideoOn, setIsMyVideoOn] = useState(true);
+    const [isScreenSharing, setIsScreenSharing] = useState(false);
     const [aiProcessing, setAiProcessing] = useState(false);
 
     // Simulation: AI Text Stream
@@ -118,13 +119,28 @@ export function VideoConference({ onLeave, toggleChat, isChatOpen }: VideoConfer
             {/* --- 2. Main Video Area --- */}
             <div className="flex-1 flex p-4 gap-4 overflow-hidden">
                 
-                {/* Whiteboard Mode Override */}
-                {isWhiteboardOpen ? (
+                {/* Whiteboard / Screen Share Mode Override */}
+                {isWhiteboardOpen || isScreenSharing ? (
                      <div className="flex-1 relative bg-white rounded-2xl overflow-hidden shadow-2xl flex">
-                        <div className="flex-1 relative">
-                            <MiroWhiteboard isEmbedded onClose={() => setIsWhiteboardOpen(false)} />
+                        <div className="flex-1 relative flex items-center justify-center bg-slate-900">
+                            {isWhiteboardOpen ? (
+                                <MiroWhiteboard isEmbedded onClose={() => setIsWhiteboardOpen(false)} />
+                            ) : (
+                                <div className="text-center">
+                                    <Monitor className="w-20 h-20 text-indigo-500 mx-auto mb-4 animate-pulse" />
+                                    <h3 className="text-2xl font-bold text-white mb-2">Screen Sharing Active</h3>
+                                    <p className="text-slate-400">You are sharing your screen with participants.</p>
+                                    <Button 
+                                        variant="destructive" 
+                                        className="mt-6"
+                                        onClick={() => setIsScreenSharing(false)}
+                                    >
+                                        Stop Sharing
+                                    </Button>
+                                </div>
+                            )}
                         </div>
-                        {/* Right Sidebar for Video Thumbnails during Whiteboard */}
+                        {/* Right Sidebar for Video Thumbnails */}
                         <div className="w-48 bg-slate-900 border-l border-slate-800 flex flex-col p-2 gap-2 overflow-y-auto">
                             {PARTICIPANTS.map(p => (
                                 <div key={p.id} className="aspect-video bg-slate-800 rounded-lg overflow-hidden border border-slate-700 relative shrink-0">
@@ -324,13 +340,29 @@ export function VideoConference({ onLeave, toggleChat, isChatOpen }: VideoConfer
                         size="icon" 
                         className="rounded-full w-12 h-12"
                         onClick={() => setIsMyVideoOn(!isMyVideoOn)}
+                        title={isMyVideoOn ? "Turn Off Camera (Voice Only)" : "Turn On Camera"}
                     >
                         {isMyVideoOn ? <Video className="h-5 w-5" /> : <VideoOff className="h-5 w-5" />}
                     </Button>
                     <Button 
+                        variant={isScreenSharing ? "default" : "secondary"}
+                        size="icon"
+                        className={cn("rounded-full w-12 h-12", isScreenSharing && "bg-green-600 hover:bg-green-700")}
+                        onClick={() => {
+                            setIsScreenSharing(!isScreenSharing);
+                            if (isWhiteboardOpen) setIsWhiteboardOpen(false);
+                        }}
+                        title="Share Screen"
+                    >
+                        <ScreenShare className="h-5 w-5" />
+                    </Button>
+                    <Button 
                         variant={isWhiteboardOpen ? "default" : "secondary"}
                         className={cn("rounded-full h-12 px-6 gap-2", isWhiteboardOpen && "bg-indigo-600 hover:bg-indigo-700")}
-                        onClick={() => setIsWhiteboardOpen(!isWhiteboardOpen)}
+                        onClick={() => {
+                            setIsWhiteboardOpen(!isWhiteboardOpen);
+                            if (isScreenSharing) setIsScreenSharing(false);
+                        }}
                     >
                         <Layout className="h-5 w-5" />
                         <span>Whiteboard</span>

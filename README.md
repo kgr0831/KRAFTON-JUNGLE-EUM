@@ -1,7 +1,7 @@
 
-  # School Teacher Dashboard
+  # 셈플
 
-  This is a code bundle for School Teacher Dashboard. The original project is available at https://www.figma.com/design/t56nRmoN4bKxSeyXHaS9O7/School-Teacher-Dashboard.
+  This is a code bundle for 셈플. The original project is available at https://www.figma.com/design/t56nRmoN4bKxSeyXHaS9O7/%EC%85%88%ED%94%8C.
 
   ## Running the code
 

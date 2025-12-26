@@ -6,7 +6,11 @@ import { Avatar, AvatarFallback, AvatarImage } from '../ui/avatar';
 import { Globe, Send, RefreshCw, Languages } from 'lucide-react';
 import { Message } from '../../types';
 
-export function TranslationChat() {
+interface TranslationChatProps {
+    onOpenProfile?: (userName: string) => void;
+}
+
+export function TranslationChat({ onOpenProfile }: TranslationChatProps) {
   const [messages, setMessages] = useState<Message[]>([
     { 
       id: '1', 
@@ -96,14 +100,22 @@ export function TranslationChat() {
         <div className="space-y-4">
           {messages.map((msg) => (
             <div key={msg.id} className={`flex gap-3 ${msg.sender.id === 'me' ? 'flex-row-reverse' : ''}`}>
-              <Avatar className="h-8 w-8 mt-1 border">
+              <Avatar 
+                className="h-8 w-8 mt-1 border cursor-pointer hover:ring-2 hover:ring-indigo-200 transition-all" 
+                onClick={() => onOpenProfile && onOpenProfile(msg.sender.name)}
+              >
                 <AvatarFallback className="text-xs text-white" style={{ backgroundColor: msg.sender.color }}>
                   {msg.sender.name[0]}
                 </AvatarFallback>
               </Avatar>
               <div className={`flex flex-col max-w-[80%] ${msg.sender.id === 'me' ? 'items-end' : 'items-start'}`}>
                 <div className="flex items-center gap-2 mb-1">
-                  <span className="text-xs font-bold text-gray-700">{msg.sender.name}</span>
+                  <span 
+                    className="text-xs font-bold text-gray-700 cursor-pointer hover:underline"
+                    onClick={() => onOpenProfile && onOpenProfile(msg.sender.name)}
+                  >
+                      {msg.sender.name}
+                  </span>
                   <span className="text-[10px] text-gray-400">{msg.timestamp}</span>
                 </div>
                 
@@ -117,7 +129,7 @@ export function TranslationChat() {
                   {/* Translate Button for incoming foreign messages */}
                   {msg.sender.id !== 'me' && msg.sender.language !== 'ko' && !msg.translatedContent && (
                     <button 
-                        onClick={() => handleTranslateMessage(msg.id)}
+                        onClick={(e) => { e.stopPropagation(); handleTranslateMessage(msg.id); }}
                         className="absolute -right-6 bottom-0 p-1 opacity-0 group-hover:opacity-100 hover:bg-gray-200 rounded transition-all"
                         title="한국어로 번역"
                     >
