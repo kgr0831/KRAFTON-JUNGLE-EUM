@@ -3,7 +3,7 @@
 import { useState, useEffect, useCallback } from "react";
 import { useRouter, useParams } from "next/navigation";
 import { useAuth } from "../../lib/auth-context";
-import { apiClient, Workspace } from "../../lib/api";
+import { apiClient, Workspace, ChatRoom, Meeting } from "../../lib/api";
 import Sidebar from "./components/Sidebar";
 import MembersSection from "./components/MembersSection";
 import ChatSection from "./components/ChatSection";
@@ -22,6 +22,10 @@ export default function WorkspaceDetailPage() {
   const [workspace, setWorkspace] = useState<Workspace | null>(null);
   const [isLoadingWorkspace, setIsLoadingWorkspace] = useState(true);
   const [error, setError] = useState<string | null>(null);
+
+  // 사이드바 데이터
+  const [chatRooms, setChatRooms] = useState<ChatRoom[]>([]);
+  const [meetings, setMeetings] = useState<Meeting[]>([]);
 
   // 워크스페이스 조회
   const fetchWorkspace = useCallback(async () => {
@@ -51,12 +55,33 @@ export default function WorkspaceDetailPage() {
     }
   }, [isLoading, isAuthenticated, router]);
 
+  // 사이드바 데이터 로드
+  const fetchSidebarData = useCallback(async (workspaceId: number) => {
+    try {
+      const [chatRoomsRes, meetingsRes] = await Promise.all([
+        apiClient.getChatRooms(workspaceId),
+        apiClient.getWorkspaceMeetings(workspaceId),
+      ]);
+      setChatRooms(chatRoomsRes.chatrooms);
+      setMeetings(meetingsRes.meetings);
+    } catch (err) {
+      console.error("Failed to fetch sidebar data:", err);
+    }
+  }, []);
+
   // 워크스페이스 로드
   useEffect(() => {
     if (isAuthenticated) {
       fetchWorkspace();
     }
   }, [isAuthenticated, fetchWorkspace]);
+
+  // 사이드바 데이터 로드
+  useEffect(() => {
+    if (workspace) {
+      fetchSidebarData(workspace.id);
+    }
+  }, [workspace, fetchSidebarData]);
 
   if (isLoading || isLoadingWorkspace) {
     return (
@@ -89,6 +114,12 @@ export default function WorkspaceDetailPage() {
   }
 
   const renderContent = () => {
+    // 채팅방 채널 처리
+    if (activeSection.startsWith("chatroom-")) {
+      const roomId = parseInt(activeSection.replace("chatroom-", ""));
+      return <ChatSection workspaceId={workspace.id} selectedRoomId={roomId} />;
+    }
+
     // 통화방 채널 처리
     if (activeSection.startsWith("call-")) {
       return <CallsSection workspaceId={workspace.id} channelId={activeSection} />;
@@ -114,11 +145,15 @@ export default function WorkspaceDetailPage() {
     <div className="h-screen bg-white flex overflow-hidden">
       {/* Sidebar */}
       <Sidebar
+        workspaceId={workspace.id}
         workspaceName={workspace.name}
         activeSection={activeSection}
         onSectionChange={setActiveSection}
         isCollapsed={isSidebarCollapsed}
         onToggleCollapse={() => setIsSidebarCollapsed(!isSidebarCollapsed)}
+        chatRooms={chatRooms}
+        meetings={meetings}
+        onRefreshSidebar={() => fetchSidebarData(workspace.id)}
       />
 
       {/* Main Content */}
@@ -132,13 +167,12 @@ export default function WorkspaceDetailPage() {
           <div className="flex items-center gap-3">
             <button
               onClick={() => router.push("/workspace")}
-              className="flex items-center gap-2 px-3 py-1.5 text-sm font-medium text-red-500 hover:bg-red-50 rounded-lg transition-colors mr-2"
-              title="워크스페이스 나가기"
+              className="p-2 rounded-lg text-black/40 hover:text-black/70 hover:bg-black/5 transition-colors"
+              title="워크스페이스 목록"
             >
-              <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M17 16l4-4m0 0l-4-4m4 4H7m6 4v1a3 3 0 01-3 3H6a3 3 0 01-3-3V7a3 3 0 013-3h4a3 3 0 013 3v1" />
+              <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M10 19l-7-7m0 0l7-7m-7 7h18" />
               </svg>
-              나가기
             </button>
             <button className="p-2 rounded-lg hover:bg-black/5 text-black/40 hover:text-black/70 transition-colors">
               <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">

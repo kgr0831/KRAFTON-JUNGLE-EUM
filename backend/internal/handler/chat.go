@@ -1,6 +1,8 @@
 package handler
 
 import (
+	"math/rand"
+
 	"github.com/gofiber/fiber/v2"
 	"gorm.io/gorm"
 
@@ -33,6 +35,20 @@ type ChatLogResponse struct {
 type SendMessageRequest struct {
 	Message string `json:"message"`
 	Type    string `json:"type,omitempty"` // TEXT, SYSTEM
+}
+
+// CreateChatRoomRequest 채팅방 생성 요청
+type CreateChatRoomRequest struct {
+	Title string `json:"title"`
+}
+
+// ChatRoomResponse 채팅방 응답
+type ChatRoomResponse struct {
+	ID           int64   `json:"id"`
+	WorkspaceID  int64   `json:"workspace_id"`
+	Title        string  `json:"title"`
+	CreatedAt    string  `json:"created_at"`
+	MessageCount int64   `json:"message_count"`
 }
 
 // GetWorkspaceChats 워크스페이스 채팅 목록 조회
@@ -178,6 +194,333 @@ func (h *ChatHandler) SendMessage(c *fiber.Ctx) error {
 	return c.Status(fiber.StatusCreated).JSON(h.toChatLogResponse(&chatLog))
 }
 
+// GetChatRooms 채팅방 목록 조회
+func (h *ChatHandler) GetChatRooms(c *fiber.Ctx) error {
+	claims := c.Locals("claims").(*auth.Claims)
+	workspaceID, err := c.ParamsInt("workspaceId")
+	if err != nil {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"error": "invalid workspace id",
+		})
+	}
+
+	// 멤버 확인
+	if !h.isWorkspaceMember(int64(workspaceID), claims.UserID) {
+		return c.Status(fiber.StatusForbidden).JSON(fiber.Map{
+			"error": "you are not a member of this workspace",
+		})
+	}
+
+	// 기존 WORKSPACE_CHAT을 CHAT_ROOM으로 마이그레이션
+	h.db.Model(&model.Meeting{}).
+		Where("workspace_id = ? AND type = ?", workspaceID, "WORKSPACE_CHAT").
+		Update("type", "CHAT_ROOM")
+
+	// 채팅방 목록 조회 (CHAT_ROOM 타입)
+	var meetings []model.Meeting
+	err = h.db.
+		Where("workspace_id = ? AND type = ?", workspaceID, "CHAT_ROOM").
+		Order("id ASC").
+		Find(&meetings).Error
+
+	if err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+			"error": "failed to get chat rooms",
+		})
+	}
+
+	// 각 채팅방의 메시지 수 조회
+	responses := make([]ChatRoomResponse, len(meetings))
+	for i, m := range meetings {
+		var msgCount int64
+		h.db.Model(&model.ChatLog{}).Where("meeting_id = ?", m.ID).Count(&msgCount)
+
+		responses[i] = ChatRoomResponse{
+			ID:           m.ID,
+			WorkspaceID:  *m.WorkspaceID,
+			Title:        m.Title,
+			CreatedAt:    m.CreatedAt.Format("2006-01-02T15:04:05Z07:00"),
+			MessageCount: msgCount,
+		}
+	}
+
+	return c.JSON(fiber.Map{
+		"chatrooms": responses,
+		"total":     len(responses),
+	})
+}
+
+// CreateChatRoom 채팅방 생성
+func (h *ChatHandler) CreateChatRoom(c *fiber.Ctx) error {
+	claims := c.Locals("claims").(*auth.Claims)
+	workspaceID, err := c.ParamsInt("workspaceId")
+	if err != nil {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"error": "invalid workspace id",
+		})
+	}
+
+	// 멤버 확인
+	if !h.isWorkspaceMember(int64(workspaceID), claims.UserID) {
+		return c.Status(fiber.StatusForbidden).JSON(fiber.Map{
+			"error": "you are not a member of this workspace",
+		})
+	}
+
+	var req CreateChatRoomRequest
+	if err := c.BodyParser(&req); err != nil {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"error": "invalid request body",
+		})
+	}
+
+	if req.Title == "" {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"error": "title is required",
+		})
+	}
+
+	req.Title = sanitizeString(req.Title)
+	if len(req.Title) > 100 {
+		req.Title = req.Title[:100]
+	}
+
+	// 채팅방 생성 (Meeting 타입: CHAT_ROOM)
+	wsID := int64(workspaceID)
+	meeting := model.Meeting{
+		WorkspaceID: &wsID,
+		HostID:      claims.UserID,
+		Title:       req.Title,
+		Code:        generateMeetingCode(),
+		Type:        "CHAT_ROOM",
+		Status:      "ACTIVE",
+	}
+
+	if err := h.db.Create(&meeting).Error; err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+			"error": "failed to create chat room",
+		})
+	}
+
+	return c.Status(fiber.StatusCreated).JSON(ChatRoomResponse{
+		ID:           meeting.ID,
+		WorkspaceID:  wsID,
+		Title:        meeting.Title,
+		CreatedAt:    meeting.CreatedAt.Format("2006-01-02T15:04:05Z07:00"),
+		MessageCount: 0,
+	})
+}
+
+// GetChatRoomMessages 채팅방 메시지 조회
+func (h *ChatHandler) GetChatRoomMessages(c *fiber.Ctx) error {
+	claims := c.Locals("claims").(*auth.Claims)
+	workspaceID, err := c.ParamsInt("workspaceId")
+	if err != nil {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"error": "invalid workspace id",
+		})
+	}
+	roomID, err := c.ParamsInt("roomId")
+	if err != nil {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"error": "invalid room id",
+		})
+	}
+
+	// 멤버 확인
+	if !h.isWorkspaceMember(int64(workspaceID), claims.UserID) {
+		return c.Status(fiber.StatusForbidden).JSON(fiber.Map{
+			"error": "you are not a member of this workspace",
+		})
+	}
+
+	// 채팅방 확인
+	var meeting model.Meeting
+	err = h.db.Where("id = ? AND workspace_id = ? AND type = ?", roomID, workspaceID, "CHAT_ROOM").First(&meeting).Error
+	if err == gorm.ErrRecordNotFound {
+		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{
+			"error": "chat room not found",
+		})
+	}
+	if err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+			"error": "failed to get chat room",
+		})
+	}
+
+	// 채팅 로그 조회
+	var chatLogs []model.ChatLog
+	limit := c.QueryInt("limit", 50)
+	offset := c.QueryInt("offset", 0)
+
+	err = h.db.
+		Where("meeting_id = ?", roomID).
+		Preload("Sender").
+		Order("created_at DESC").
+		Limit(limit).
+		Offset(offset).
+		Find(&chatLogs).Error
+
+	if err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+			"error": "failed to get chat logs",
+		})
+	}
+
+	// 응답 변환 (역순으로 정렬하여 시간순으로)
+	responses := make([]ChatLogResponse, len(chatLogs))
+	for i, log := range chatLogs {
+		responses[len(chatLogs)-1-i] = h.toChatLogResponse(&log)
+	}
+
+	return c.JSON(fiber.Map{
+		"room_id":  roomID,
+		"messages": responses,
+		"total":    len(responses),
+	})
+}
+
+// SendChatRoomMessage 채팅방 메시지 전송
+func (h *ChatHandler) SendChatRoomMessage(c *fiber.Ctx) error {
+	claims := c.Locals("claims").(*auth.Claims)
+	workspaceID, err := c.ParamsInt("workspaceId")
+	if err != nil {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"error": "invalid workspace id",
+		})
+	}
+	roomID, err := c.ParamsInt("roomId")
+	if err != nil {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"error": "invalid room id",
+		})
+	}
+
+	// 멤버 확인
+	if !h.isWorkspaceMember(int64(workspaceID), claims.UserID) {
+		return c.Status(fiber.StatusForbidden).JSON(fiber.Map{
+			"error": "you are not a member of this workspace",
+		})
+	}
+
+	// 채팅방 확인
+	var meeting model.Meeting
+	err = h.db.Where("id = ? AND workspace_id = ? AND type = ?", roomID, workspaceID, "CHAT_ROOM").First(&meeting).Error
+	if err == gorm.ErrRecordNotFound {
+		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{
+			"error": "chat room not found",
+		})
+	}
+	if err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+			"error": "failed to get chat room",
+		})
+	}
+
+	var req SendMessageRequest
+	if err := c.BodyParser(&req); err != nil {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"error": "invalid request body",
+		})
+	}
+
+	if req.Message == "" {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"error": "message is required",
+		})
+	}
+
+	// 메시지 정제
+	req.Message = sanitizeString(req.Message)
+	if len(req.Message) > 2000 {
+		req.Message = req.Message[:2000]
+	}
+
+	if req.Type == "" {
+		req.Type = "TEXT"
+	}
+
+	// 채팅 로그 생성
+	chatLog := model.ChatLog{
+		MeetingID: int64(roomID),
+		SenderID:  &claims.UserID,
+		Message:   &req.Message,
+		Type:      req.Type,
+	}
+
+	if err := h.db.Create(&chatLog).Error; err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+			"error": "failed to send message",
+		})
+	}
+
+	// Sender 정보 로드
+	h.db.Preload("Sender").First(&chatLog, chatLog.ID)
+
+	return c.Status(fiber.StatusCreated).JSON(h.toChatLogResponse(&chatLog))
+}
+
+// DeleteChatRoom 채팅방 삭제
+func (h *ChatHandler) DeleteChatRoom(c *fiber.Ctx) error {
+	claims := c.Locals("claims").(*auth.Claims)
+	workspaceID, err := c.ParamsInt("workspaceId")
+	if err != nil {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"error": "invalid workspace id",
+		})
+	}
+	roomID, err := c.ParamsInt("roomId")
+	if err != nil {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"error": "invalid room id",
+		})
+	}
+
+	// 멤버 확인
+	if !h.isWorkspaceMember(int64(workspaceID), claims.UserID) {
+		return c.Status(fiber.StatusForbidden).JSON(fiber.Map{
+			"error": "you are not a member of this workspace",
+		})
+	}
+
+	// 채팅방 확인
+	var meeting model.Meeting
+	err = h.db.Where("id = ? AND workspace_id = ? AND type = ?", roomID, workspaceID, "CHAT_ROOM").First(&meeting).Error
+	if err == gorm.ErrRecordNotFound {
+		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{
+			"error": "chat room not found",
+		})
+	}
+	if err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+			"error": "failed to get chat room",
+		})
+	}
+
+	// 트랜잭션으로 채팅 로그와 채팅방 삭제
+	err = h.db.Transaction(func(tx *gorm.DB) error {
+		// 채팅 로그 삭제
+		if err := tx.Where("meeting_id = ?", roomID).Delete(&model.ChatLog{}).Error; err != nil {
+			return err
+		}
+		// 채팅방 삭제
+		if err := tx.Delete(&meeting).Error; err != nil {
+			return err
+		}
+		return nil
+	})
+
+	if err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+			"error": "failed to delete chat room",
+		})
+	}
+
+	return c.JSON(fiber.Map{
+		"message": "chat room deleted successfully",
+	})
+}
+
 // 헬퍼 함수
 func (h *ChatHandler) isWorkspaceMember(workspaceID, userID int64) bool {
 	var count int64
@@ -217,7 +560,7 @@ func generateMeetingCode() string {
 	const charset = "abcdefghijklmnopqrstuvwxyz0123456789"
 	code := make([]byte, 10)
 	for i := range code {
-		code[i] = charset[i%len(charset)]
+		code[i] = charset[rand.Intn(len(charset))]
 	}
 	return string(code)
 }

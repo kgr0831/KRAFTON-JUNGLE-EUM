@@ -1,11 +1,12 @@
 "use client";
 
 import { useState, useRef, useEffect, useCallback } from "react";
-import { apiClient, ChatMessage } from "../../../lib/api";
+import { apiClient, ChatMessage, ChatRoom } from "../../../lib/api";
 import { useAuth } from "../../../lib/auth-context";
 
 interface ChatSectionProps {
   workspaceId: number;
+  selectedRoomId?: number;
 }
 
 interface TypingUser {
@@ -26,47 +27,188 @@ interface WSMessage {
 }
 
 const WS_BASE_URL = process.env.NEXT_PUBLIC_CHAT_WS_URL || 'ws://localhost:8080';
+const MESSAGES_PER_PAGE = 30;
 
-export default function ChatSection({ workspaceId }: ChatSectionProps) {
+export default function ChatSection({ workspaceId, selectedRoomId }: ChatSectionProps) {
   const { user } = useAuth();
+
+  // 채팅방 상태
+  const [selectedRoom, setSelectedRoom] = useState<ChatRoom | null>(null);
+  const [isLoadingRoom, setIsLoadingRoom] = useState(true);
+
+  // 메시지 상태
   const [message, setMessage] = useState("");
   const [messages, setMessages] = useState<ChatMessage[]>([]);
-  const [isLoading, setIsLoading] = useState(true);
+  const [isLoadingMessages, setIsLoadingMessages] = useState(false);
+  const [isLoadingMore, setIsLoadingMore] = useState(false);
+  const [hasMore, setHasMore] = useState(true);
   const [isSending, setIsSending] = useState(false);
   const [typingUsers, setTypingUsers] = useState<TypingUser[]>([]);
   const [lastSentTime, setLastSentTime] = useState(0);
+
+  // 스크롤 상태
+  const [showScrollToBottom, setShowScrollToBottom] = useState(false);
+  const [isAtBottom, setIsAtBottom] = useState(true);
+
+  // Refs
   const messagesContainerRef = useRef<HTMLDivElement>(null);
-  const messagesEndRef = useRef<HTMLDivElement>(null);
+  const textareaRef = useRef<HTMLTextAreaElement>(null);
   const wsRef = useRef<WebSocket | null>(null);
   const typingTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+  const scrollButtonTimeoutRef = useRef<NodeJS.Timeout | null>(null);
   const isTypingRef = useRef(false);
   const isComposingRef = useRef(false);
+  const previousScrollHeightRef = useRef<number>(0);
 
-  // 스팸 방지: 1초에 1개 메시지만 허용
   const SPAM_COOLDOWN = 1000;
+  const SCROLL_THRESHOLD = 100;
 
-  const scrollToBottom = () => {
-    if (messagesContainerRef.current) {
-      messagesContainerRef.current.scrollTop = messagesContainerRef.current.scrollHeight;
+  const resetTextareaHeight = () => {
+    if (textareaRef.current) {
+      textareaRef.current.style.height = 'auto';
+      textareaRef.current.style.overflowY = 'hidden';
     }
   };
 
-  // 초기 메시지 로드
-  const loadMessages = useCallback(async () => {
+  const scrollToBottom = (smooth = true) => {
+    if (messagesContainerRef.current) {
+      messagesContainerRef.current.scrollTo({
+        top: messagesContainerRef.current.scrollHeight,
+        behavior: smooth ? "smooth" : "auto",
+      });
+    }
+  };
+
+  // 스크롤 위치 체크
+  const checkScrollPosition = useCallback(() => {
+    if (!messagesContainerRef.current) return;
+
+    const { scrollTop, scrollHeight, clientHeight } = messagesContainerRef.current;
+    const distanceFromBottom = scrollHeight - scrollTop - clientHeight;
+
+    setIsAtBottom(distanceFromBottom < SCROLL_THRESHOLD);
+
+    // 디바운스로 버튼 깜빡임 방지
+    if (scrollButtonTimeoutRef.current) {
+      clearTimeout(scrollButtonTimeoutRef.current);
+    }
+
+    const shouldShow = distanceFromBottom > SCROLL_THRESHOLD * 3;
+    if (shouldShow) {
+      scrollButtonTimeoutRef.current = setTimeout(() => {
+        setShowScrollToBottom(true);
+      }, 150);
+    } else {
+      setShowScrollToBottom(false);
+    }
+  }, []);
+
+  // 채팅방 정보 로드
+  const loadRoom = useCallback(async () => {
+    if (!selectedRoomId) {
+      setSelectedRoom(null);
+      setIsLoadingRoom(false);
+      return;
+    }
+
     try {
-      setIsLoading(true);
-      const response = await apiClient.getWorkspaceChats(workspaceId);
+      setIsLoadingRoom(true);
+      const response = await apiClient.getChatRooms(workspaceId);
+      const room = response.chatrooms.find(r => r.id === selectedRoomId);
+      setSelectedRoom(room || null);
+    } catch (error) {
+      console.error("Failed to load room:", error);
+    } finally {
+      setIsLoadingRoom(false);
+    }
+  }, [workspaceId, selectedRoomId]);
+
+  // 초기 메시지 로드
+  const loadMessages = useCallback(async (roomId: number) => {
+    try {
+      setIsLoadingMessages(true);
+      setHasMore(true);
+      const response = await apiClient.getChatRoomMessages(workspaceId, roomId, MESSAGES_PER_PAGE, 0);
       setMessages(response.messages);
+      setHasMore(response.messages.length >= MESSAGES_PER_PAGE);
+
+      // 초기 로드 후 맨 아래로 스크롤
+      setTimeout(() => scrollToBottom(false), 50);
     } catch (error) {
       console.error("Failed to load messages:", error);
     } finally {
-      setIsLoading(false);
+      setIsLoadingMessages(false);
     }
   }, [workspaceId]);
 
-  // WebSocket 연결
+  // 이전 메시지 로드 (무한 스크롤)
+  const loadMoreMessages = useCallback(async () => {
+    if (!selectedRoom || isLoadingMore || !hasMore) return;
+
+    try {
+      setIsLoadingMore(true);
+
+      // 현재 스크롤 높이 저장
+      if (messagesContainerRef.current) {
+        previousScrollHeightRef.current = messagesContainerRef.current.scrollHeight;
+      }
+
+      const response = await apiClient.getChatRoomMessages(
+        workspaceId,
+        selectedRoom.id,
+        MESSAGES_PER_PAGE,
+        messages.length
+      );
+
+      if (response.messages.length > 0) {
+        // 이전 메시지를 앞에 추가
+        setMessages(prev => [...response.messages, ...prev]);
+        setHasMore(response.messages.length >= MESSAGES_PER_PAGE);
+
+        // 스크롤 위치 유지
+        requestAnimationFrame(() => {
+          if (messagesContainerRef.current) {
+            const newScrollHeight = messagesContainerRef.current.scrollHeight;
+            const scrollDiff = newScrollHeight - previousScrollHeightRef.current;
+            messagesContainerRef.current.scrollTop = scrollDiff;
+          }
+        });
+      } else {
+        setHasMore(false);
+      }
+    } catch (error) {
+      console.error("Failed to load more messages:", error);
+    } finally {
+      setIsLoadingMore(false);
+    }
+  }, [selectedRoom, workspaceId, messages.length, isLoadingMore, hasMore]);
+
+  // 스크롤 이벤트 핸들러
+  const handleScroll = useCallback(() => {
+    checkScrollPosition();
+
+    // 상단에 도달하면 이전 메시지 로드
+    if (messagesContainerRef.current) {
+      const { scrollTop } = messagesContainerRef.current;
+      if (scrollTop < 100 && hasMore && !isLoadingMore) {
+        loadMoreMessages();
+      }
+    }
+  }, [checkScrollPosition, hasMore, isLoadingMore, loadMoreMessages]);
+
+  // 채팅방 로드
   useEffect(() => {
-    loadMessages();
+    loadRoom();
+  }, [loadRoom]);
+
+  // 선택된 채팅방 변경 시 메시지 로드 및 WebSocket 연결
+  useEffect(() => {
+    if (!selectedRoom) return;
+
+    loadMessages(selectedRoom.id);
+    setTypingUsers([]);
+    setShowScrollToBottom(false);
+    setIsAtBottom(true);
 
     let isMounted = true;
     let reconnectTimeout: NodeJS.Timeout | null = null;
@@ -74,12 +216,12 @@ export default function ChatSection({ workspaceId }: ChatSectionProps) {
     const connectWebSocket = () => {
       if (!isMounted) return;
 
-      const ws = new WebSocket(`${WS_BASE_URL}/ws/chat/${workspaceId}`);
+      const ws = new WebSocket(`${WS_BASE_URL}/ws/chat/${workspaceId}/${selectedRoom.id}`);
       wsRef.current = ws;
 
       ws.onopen = () => {
         if (isMounted) {
-          console.log("Chat WebSocket connected");
+          console.log("Chat WebSocket connected to room:", selectedRoom.id);
         }
       };
 
@@ -94,7 +236,7 @@ export default function ChatSection({ workspaceId }: ChatSectionProps) {
               if (data.payload && data.payload.id) {
                 const newMsg: ChatMessage = {
                   id: data.payload.id,
-                  meeting_id: 0,
+                  meeting_id: selectedRoom.id,
                   sender_id: data.payload.sender_id,
                   message: data.payload.message || "",
                   type: "TEXT",
@@ -105,13 +247,17 @@ export default function ChatSection({ workspaceId }: ChatSectionProps) {
                     nickname: data.payload.nickname || "",
                   },
                 };
-                // 중복 메시지 방지
                 setMessages((prev) => {
                   if (prev.some((m) => m.id === newMsg.id)) {
                     return prev;
                   }
                   return [...prev, newMsg];
                 });
+
+                // 내가 보낸 메시지거나 맨 아래에 있으면 스크롤
+                if (data.payload.sender_id === user?.id) {
+                  setTimeout(() => scrollToBottom(true), 50);
+                }
               }
               break;
 
@@ -144,13 +290,11 @@ export default function ChatSection({ workspaceId }: ChatSectionProps) {
       ws.onclose = () => {
         if (isMounted) {
           console.log("Chat WebSocket disconnected");
-          // 재연결 시도
           reconnectTimeout = setTimeout(connectWebSocket, 3000);
         }
       };
 
       ws.onerror = () => {
-        // Strict Mode에서 발생하는 에러는 무시
         if (!isMounted) return;
       };
     };
@@ -166,13 +310,15 @@ export default function ChatSection({ workspaceId }: ChatSectionProps) {
         wsRef.current.close();
       }
     };
-  }, [workspaceId, loadMessages]);
+  }, [selectedRoom, workspaceId, loadMessages, user?.id]);
 
+  // 맨 아래에 있을 때만 새 메시지에 자동 스크롤
   useEffect(() => {
-    scrollToBottom();
-  }, [messages]);
+    if (isAtBottom && messages.length > 0) {
+      scrollToBottom(true);
+    }
+  }, [messages, isAtBottom]);
 
-  // 타이핑 상태 전송
   const sendTypingStatus = (isTyping: boolean) => {
     if (wsRef.current?.readyState === WebSocket.OPEN) {
       wsRef.current.send(
@@ -183,17 +329,21 @@ export default function ChatSection({ workspaceId }: ChatSectionProps) {
     }
   };
 
-  // 입력 중 처리
   const handleInputChange = (e: React.ChangeEvent<HTMLTextAreaElement>) => {
     setMessage(e.target.value);
 
-    // 타이핑 상태 전송
+    // Auto-resize textarea
+    const textarea = e.target;
+    textarea.style.height = 'auto';
+    const maxHeight = 120; // 최대 높이 (약 5줄)
+    textarea.style.height = Math.min(textarea.scrollHeight, maxHeight) + 'px';
+    textarea.style.overflowY = textarea.scrollHeight > maxHeight ? 'auto' : 'hidden';
+
     if (!isTypingRef.current && e.target.value.length > 0) {
       isTypingRef.current = true;
       sendTypingStatus(true);
     }
 
-    // 타이핑 타임아웃 리셋
     if (typingTimeoutRef.current) {
       clearTimeout(typingTimeoutRef.current);
     }
@@ -207,21 +357,18 @@ export default function ChatSection({ workspaceId }: ChatSectionProps) {
   };
 
   const handleSend = async () => {
-    if (!message.trim() || isSending) return;
+    if (!message.trim() || isSending || !selectedRoom) return;
 
-    // 스팸 방지
     const now = Date.now();
     if (now - lastSentTime < SPAM_COOLDOWN) {
       return;
     }
 
-    // 타이핑 상태 해제
     if (isTypingRef.current) {
       isTypingRef.current = false;
       sendTypingStatus(false);
     }
 
-    // WebSocket으로 메시지 전송
     if (wsRef.current?.readyState === WebSocket.OPEN) {
       wsRef.current.send(
         JSON.stringify({
@@ -233,14 +380,16 @@ export default function ChatSection({ workspaceId }: ChatSectionProps) {
       );
       setMessage("");
       setLastSentTime(now);
+      resetTextareaHeight();
     } else {
-      // Fallback: REST API 사용
       try {
         setIsSending(true);
-        const newMessage = await apiClient.sendMessage(workspaceId, message.trim());
+        const newMessage = await apiClient.sendChatRoomMessage(workspaceId, selectedRoom.id, message.trim());
         setMessages((prev) => [...prev, newMessage]);
         setMessage("");
         setLastSentTime(now);
+        resetTextareaHeight();
+        setTimeout(() => scrollToBottom(true), 50);
       } catch (error) {
         console.error("Failed to send message:", error);
       } finally {
@@ -277,7 +426,7 @@ export default function ChatSection({ workspaceId }: ChatSectionProps) {
     return msg.sender_id === user?.id;
   };
 
-  if (isLoading) {
+  if (isLoadingRoom) {
     return (
       <div className="h-full flex items-center justify-center">
         <div className="w-8 h-8 border-2 border-black/20 border-t-black/60 rounded-full animate-spin" />
@@ -285,12 +434,24 @@ export default function ChatSection({ workspaceId }: ChatSectionProps) {
     );
   }
 
+  if (!selectedRoom) {
+    return (
+      <div className="h-full flex flex-col items-center justify-center text-black/40">
+        <svg className="w-20 h-20 mb-4 opacity-20" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1} d="M8 12h.01M12 12h.01M16 12h.01M21 12c0 4.418-4.03 8-9 8a9.863 9.863 0 01-4.255-.949L3 20l1.395-3.72C3.512 15.042 3 13.574 3 12c0-4.418 4.03-8 9-8s9 3.582 9 8z" />
+        </svg>
+        <p className="text-lg">채팅방을 선택하세요</p>
+        <p className="text-sm mt-1">왼쪽 사이드바에서 채팅방을 선택하세요</p>
+      </div>
+    );
+  }
+
   return (
-    <div className="h-full flex flex-col bg-white overflow-hidden">
-      {/* Header */}
+    <div className="h-full flex flex-col bg-white overflow-hidden relative">
+      {/* Room Header */}
       <div className="px-8 py-5 border-b border-black/5 flex items-center justify-between">
         <div>
-          <h1 className="text-xl font-semibold text-black">팀 채팅</h1>
+          <h2 className="text-lg font-semibold text-black">{selectedRoom.title}</h2>
           <p className="text-sm text-black/40 mt-0.5">
             {messages.length}개의 메시지
             {typingUsers.length > 0 && (
@@ -303,8 +464,30 @@ export default function ChatSection({ workspaceId }: ChatSectionProps) {
       </div>
 
       {/* Messages */}
-      <div ref={messagesContainerRef} className="flex-1 overflow-y-auto px-8 py-6">
-        {messages.length === 0 ? (
+      <div
+        ref={messagesContainerRef}
+        className="flex-1 overflow-y-auto px-8 py-6"
+        onScroll={handleScroll}
+      >
+        {/* Loading More Indicator */}
+        {isLoadingMore && (
+          <div className="flex justify-center py-4">
+            <div className="w-5 h-5 border-2 border-black/20 border-t-black/60 rounded-full animate-spin" />
+          </div>
+        )}
+
+        {/* Beginning of conversation */}
+        {!hasMore && messages.length > 0 && (
+          <div className="flex justify-center py-6 mb-4">
+            <p className="text-sm text-black/30">여기서 이야기가 시작되었습니다</p>
+          </div>
+        )}
+
+        {isLoadingMessages ? (
+          <div className="h-full flex items-center justify-center">
+            <div className="w-6 h-6 border-2 border-black/20 border-t-black/60 rounded-full animate-spin" />
+          </div>
+        ) : messages.length === 0 ? (
           <div className="h-full flex flex-col items-center justify-center text-black/40">
             <svg className="w-16 h-16 mb-4 opacity-30" fill="none" stroke="currentColor" viewBox="0 0 24 24">
               <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1} d="M8 12h.01M12 12h.01M16 12h.01M21 12c0 4.418-4.03 8-9 8a9.863 9.863 0 01-4.255-.949L3 20l1.395-3.72C3.512 15.042 3 13.574 3 12c0-4.418 4.03-8 9-8s9 3.582 9 8z" />
@@ -325,8 +508,7 @@ export default function ChatSection({ workspaceId }: ChatSectionProps) {
                   key={msg.id}
                   className={`flex ${isMe ? "justify-end" : "justify-start"}`}
                 >
-                  <div className={`flex gap-2 max-w-[75%] ${isMe ? "flex-row-reverse" : ""}`}>
-                    {/* Avatar */}
+                  <div className={`flex gap-2 max-w-[40%] ${isMe ? "flex-row-reverse" : ""}`}>
                     {!isMe && (
                       <div className="w-8 flex-shrink-0 self-end">
                         {showAvatar && (
@@ -347,15 +529,14 @@ export default function ChatSection({ workspaceId }: ChatSectionProps) {
                       </div>
                     )}
 
-                    {/* Message Bubble */}
-                    <div className={`flex flex-col ${isMe ? "items-end" : "items-start"}`}>
+                    <div className={`flex flex-col min-w-0 ${isMe ? "items-end" : "items-start"}`}>
                       {showName && (
                         <span className="text-xs text-black/50 mb-1 ml-1">
                           {msg.sender?.nickname || "알 수 없음"}
                         </span>
                       )}
                       <div
-                        className={`px-4 py-2 rounded-full ${
+                        className={`px-4 py-2 ${
                           isMe
                             ? "bg-black text-white"
                             : "bg-gray-100 text-black"
@@ -366,7 +547,7 @@ export default function ChatSection({ workspaceId }: ChatSectionProps) {
                             : "20px 20px 20px 4px",
                         }}
                       >
-                        <p className="text-sm leading-relaxed whitespace-pre-wrap break-words">
+                        <p className="text-sm leading-relaxed whitespace-pre-wrap break-all">
                           {msg.message}
                         </p>
                       </div>
@@ -378,10 +559,24 @@ export default function ChatSection({ workspaceId }: ChatSectionProps) {
                 </div>
               );
             })}
-            <div ref={messagesEndRef} />
           </div>
         )}
       </div>
+
+      {/* Scroll to Bottom Button */}
+      <button
+        onClick={() => scrollToBottom(true)}
+        className={`absolute bottom-32 left-1/2 -translate-x-1/2 px-4 py-2 bg-black text-white text-sm rounded-full shadow-lg hover:bg-black/80 flex items-center gap-2 transition-all duration-300 ease-out ${
+          showScrollToBottom
+            ? "opacity-100 translate-y-0"
+            : "opacity-0 translate-y-4 pointer-events-none"
+        }`}
+      >
+        <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 14l-7 7m0 0l-7-7m7 7V3" />
+        </svg>
+        최신 메시지로 이동
+      </button>
 
       {/* Typing Indicator */}
       {typingUsers.length > 0 && (
@@ -399,22 +594,24 @@ export default function ChatSection({ workspaceId }: ChatSectionProps) {
 
       {/* Input */}
       <div className="px-6 py-4 border-t border-black/5">
-        <div className="flex items-center gap-3 bg-gray-100 rounded-full px-4 py-2 focus-within:bg-gray-50 focus-within:ring-2 focus-within:ring-black/10 transition-all">
+        <div className="flex items-end gap-3 bg-gray-100 rounded-[24px] px-4 py-2 focus-within:bg-gray-50 focus-within:ring-2 focus-within:ring-black/10 transition-all">
           <textarea
+            ref={textareaRef}
             value={message}
             onChange={handleInputChange}
             onKeyDown={handleKeyDown}
             onCompositionStart={handleCompositionStart}
             onCompositionEnd={handleCompositionEnd}
             placeholder="메시지 입력..."
+            maxLength={2000}
             rows={1}
-            className="flex-1 bg-transparent resize-none text-[15px] text-black placeholder:text-black/40 focus:outline-none focus:ring-0 focus:border-0 border-0 outline-none ring-0 py-2 max-h-32 leading-relaxed"
+            className="flex-1 bg-transparent resize-none text-[15px] text-black placeholder:text-black/40 focus:outline-none focus:ring-0 focus:border-0 border-0 outline-none ring-0 py-2 leading-5 overflow-hidden"
             style={{ outline: 'none', boxShadow: 'none' }}
           />
           <button
             onClick={handleSend}
             disabled={!message.trim() || isSending}
-            className={`p-2.5 rounded-full transition-all flex-shrink-0 ${
+            className={`p-2 rounded-full transition-all flex-shrink-0 ${
               message.trim() && !isSending
                 ? "bg-black text-white hover:bg-black/80"
                 : "bg-black/10 text-black/30 cursor-not-allowed"
