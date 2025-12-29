@@ -235,13 +235,13 @@ export default function Sidebar({
                       key={room.id}
                       onClick={() => onSectionChange(`chatroom-${room.id}`)}
                       onContextMenu={(e) => handleContextMenu(e, room)}
-                      className={`w-full flex items-center gap-2 px-3 py-1.5 rounded-md transition-all text-sm ${
+                      className={`w-full flex items-center gap-1.5 px-3 py-1.5 rounded-md transition-all text-sm ${
                         activeSection === `chatroom-${room.id}`
                           ? "bg-black/5 text-black font-medium"
                           : "text-black/50 hover:bg-black/[0.03] hover:text-black/70"
                       }`}
                     >
-                      <span className="w-1.5 h-1.5 rounded-full bg-current opacity-50" />
+                      <span className="text-black/30">#</span>
                       <span className="truncate">{room.title}</span>
                     </button>
                   ))

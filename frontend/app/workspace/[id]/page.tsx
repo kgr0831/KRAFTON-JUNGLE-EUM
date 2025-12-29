@@ -161,7 +161,17 @@ export default function WorkspaceDetailPage() {
         {/* Top Bar */}
         <header className="h-14 border-b border-black/5 flex items-center justify-between px-6">
           <div className="flex items-center gap-4">
-            {/* Breadcrumb could go here */}
+            {/* Section Title */}
+            {activeSection.startsWith("chatroom-") && (() => {
+              const roomId = parseInt(activeSection.replace("chatroom-", ""));
+              const room = chatRooms.find(r => r.id === roomId);
+              return room ? (
+                <div className="flex items-center gap-2">
+                  <span className="text-xl text-black/30">#</span>
+                  <h1 className="text-lg font-semibold text-black">{room.title}</h1>
+                </div>
+              ) : null;
+            })()}
           </div>
 
           <div className="flex items-center gap-3">

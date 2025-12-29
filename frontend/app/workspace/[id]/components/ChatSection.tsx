@@ -614,21 +614,6 @@ export default function ChatSection({ workspaceId, selectedRoomId }: ChatSection
 
   return (
     <div className="h-full flex flex-col bg-white overflow-hidden relative">
-      {/* Room Header */}
-      <div className="px-8 py-5 border-b border-black/5 flex items-center justify-between">
-        <div>
-          <h2 className="text-lg font-semibold text-black">{selectedRoom.title}</h2>
-          <p className="text-sm text-black/40 mt-0.5">
-            {messages.length}개의 메시지
-            {typingUsers.length > 0 && (
-              <span className="ml-2 text-black/60 animate-pulse">
-                · {typingUsers.map((u) => u.nickname).join(", ")} 입력 중...
-              </span>
-            )}
-          </p>
-        </div>
-      </div>
-
       {/* Messages */}
       <div
         ref={messagesContainerRef}
