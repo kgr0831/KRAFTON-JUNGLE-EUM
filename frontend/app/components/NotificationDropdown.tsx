@@ -4,12 +4,14 @@ import { useState, useEffect, useRef, useCallback } from "react";
 import { apiClient, Notification } from "../lib/api";
 import { NotificationType } from "../lib/constants";
 import { useNotificationWebSocket } from "../hooks/useNotificationWebSocket";
+import { useAuth } from "../lib/auth-context";
 
 interface NotificationDropdownProps {
     onInvitationAccepted?: (workspaceId: number) => void;
 }
 
 export default function NotificationDropdown({ onInvitationAccepted }: NotificationDropdownProps) {
+    const { isAuthenticated } = useAuth();
     const [isOpen, setIsOpen] = useState(false);
     const [notifications, setNotifications] = useState<Notification[]>([]);
     const [isLoading, setIsLoading] = useState(false);
@@ -18,6 +20,7 @@ export default function NotificationDropdown({ onInvitationAccepted }: Notificat
 
     // 알림 목록 가져오기
     const fetchNotifications = useCallback(async () => {
+        if (!isAuthenticated) return;
         try {
             setIsLoading(true);
             const response = await apiClient.getMyNotifications();
@@ -27,7 +30,7 @@ export default function NotificationDropdown({ onInvitationAccepted }: Notificat
         } finally {
             setIsLoading(false);
         }
-    }, []);
+    }, [isAuthenticated]);
 
     // WebSocket으로 실시간 알림 수신
     const handleNewNotification = useCallback((notification: Notification) => {
@@ -43,24 +46,24 @@ export default function NotificationDropdown({ onInvitationAccepted }: Notificat
 
     useNotificationWebSocket({
         onNotification: handleNewNotification,
-        enabled: true,
+        enabled: isAuthenticated,
     });
 
-    // 초기 로드 (한 번만)
-    const initialLoadRef = useRef(false);
+    // 인증 시 알림 목록 로드
     useEffect(() => {
-        if (!initialLoadRef.current) {
-            initialLoadRef.current = true;
+        if (isAuthenticated) {
             fetchNotifications();
+        } else {
+            setNotifications([]);
         }
-    }, [fetchNotifications]);
+    }, [isAuthenticated, fetchNotifications]);
 
     // 드롭다운 열릴 때 알림 목록 가져오기
     useEffect(() => {
-        if (isOpen) {
+        if (isOpen && isAuthenticated) {
             fetchNotifications();
         }
-    }, [isOpen, fetchNotifications]);
+    }, [isOpen, isAuthenticated, fetchNotifications]);
 
     // 외부 클릭 시 드롭다운 닫기
     useEffect(() => {

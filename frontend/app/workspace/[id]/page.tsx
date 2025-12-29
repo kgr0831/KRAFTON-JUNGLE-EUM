@@ -126,21 +126,17 @@ export default function WorkspaceDetailPage() {
       <div className="flex-1 flex flex-col overflow-hidden">
         {/* Top Bar */}
         <header className="h-14 border-b border-black/5 flex items-center justify-between px-6">
-          <div className="flex items-center gap-4">
-            {/* Breadcrumb could go here */}
-          </div>
+          <button
+            onClick={() => router.push("/workspace")}
+            className="group flex items-center gap-2 text-black/40 hover:text-black transition-colors"
+          >
+            <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M15 19l-7-7 7-7" />
+            </svg>
+            <span className="text-sm font-medium">워크스페이스</span>
+          </button>
 
           <div className="flex items-center gap-3">
-            <button
-              onClick={() => router.push("/workspace")}
-              className="flex items-center gap-2 px-3 py-1.5 text-sm font-medium text-black/60 hover:bg-black/5 rounded-lg transition-colors mr-2"
-              title="메인으로"
-            >
-              <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M3 12l2-2m0 0l7-7 7 7M5 10v10a1 1 0 001 1h3m10-11l2 2m-2-2v10a1 1 0 01-1 1h-3m-6 0a1 1 0 001-1v-4a1 1 0 011-1h2a1 1 0 011 1v4a1 1 0 001 1m-6 0h6" />
-              </svg>
-              메인으로
-            </button>
             <NotificationDropdown onInvitationAccepted={() => router.push("/workspace")} />
             {user.profileImg ? (
               <img

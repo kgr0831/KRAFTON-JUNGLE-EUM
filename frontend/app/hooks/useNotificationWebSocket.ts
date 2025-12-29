@@ -3,7 +3,7 @@
 import { useEffect, useRef, useCallback, useState } from "react";
 import { Notification } from "../lib/api";
 
-const WS_BASE_URL = process.env.NEXT_PUBLIC_WS_URL || 'ws://localhost:8080';
+const WS_BASE_URL = process.env.NEXT_PUBLIC_CHAT_WS_URL || 'ws://localhost:8080';
 
 interface NotificationWSMessage {
     type: "notification" | "ping" | "pong" | "error";
@@ -62,7 +62,6 @@ export function useNotificationWebSocket({
         };
 
         ws.onclose = () => {
-            console.log("Notification WebSocket disconnected");
             setIsConnected(false);
 
             // ping interval 정리
@@ -71,14 +70,14 @@ export function useNotificationWebSocket({
                 pingIntervalRef.current = null;
             }
 
-            // 재연결 시도 (5초 후)
+            // 재연결 시도 (3초 후)
             if (enabled) {
-                reconnectTimeoutRef.current = setTimeout(connect, 5000);
+                reconnectTimeoutRef.current = setTimeout(connect, 3000);
             }
         };
 
-        ws.onerror = (error) => {
-            console.error("Notification WebSocket error:", error);
+        ws.onerror = () => {
+            // 연결 실패는 onclose에서 처리되므로 여기서는 무시
         };
     }, [enabled, onNotification]);
 

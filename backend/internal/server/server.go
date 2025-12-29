@@ -235,17 +235,14 @@ func (s *Server) SetupRoutes() {
 		// 쿠키에서 JWT 토큰 추출
 		accessToken := c.Cookies("access_token")
 		if accessToken == "" {
-			return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{
-				"error": "authentication required",
-			})
+			// WebSocket은 JSON 응답 대신 연결 거부
+			return c.SendStatus(fiber.StatusUnauthorized)
 		}
 
 		// JWT 검증
 		claims, err := s.jwtManager.ValidateAccessToken(accessToken)
 		if err != nil {
-			return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{
-				"error": "invalid token",
-			})
+			return c.SendStatus(fiber.StatusUnauthorized)
 		}
 
 		c.Locals("userId", claims.UserID)

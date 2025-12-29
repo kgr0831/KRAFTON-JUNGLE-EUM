@@ -199,7 +199,8 @@ class ApiClient {
 
   private async request<T>(
     endpoint: string,
-    options: RequestInit = {}
+    options: RequestInit = {},
+    skipAutoRefresh: boolean = false
   ): Promise<T> {
     const headers: HeadersInit = {
       'Content-Type': 'application/json',
@@ -213,19 +214,22 @@ class ApiClient {
     });
 
     if (response.status === 401) {
-      // 토큰 만료 시 갱신 시도
-      const refreshed = await this.refreshToken();
-      if (refreshed) {
-        // 재시도
-        const retryResponse = await fetch(`${API_BASE_URL}${endpoint}`, {
-          ...options,
-          headers,
-          credentials: 'include',
-        });
-        if (!retryResponse.ok) {
-          throw new Error('Request failed after token refresh');
+      // auth 엔드포인트는 자동 갱신 건너뛰기
+      if (!skipAutoRefresh) {
+        // 토큰 만료 시 갱신 시도
+        const refreshed = await this.refreshToken();
+        if (refreshed) {
+          // 재시도
+          const retryResponse = await fetch(`${API_BASE_URL}${endpoint}`, {
+            ...options,
+            headers,
+            credentials: 'include',
+          });
+          if (!retryResponse.ok) {
+            throw new Error('Request failed after token refresh');
+          }
+          return retryResponse.json();
         }
-        return retryResponse.json();
       }
       this.isLoggedIn = false;
       throw new Error('Authentication required');
@@ -277,7 +281,7 @@ class ApiClient {
   }
 
   async getMe(): Promise<AuthResponse['user']> {
-    return this.request<AuthResponse['user']>('/auth/me');
+    return this.request<AuthResponse['user']>('/auth/me', {}, true);
   }
 
   // 서버에 인증 상태 확인 (쿠키 기반)
