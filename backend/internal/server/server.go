@@ -37,6 +37,8 @@ type Server struct {
 	meetingHandler        *handler.MeetingHandler
 	calendarHandler       *handler.CalendarHandler
 	storageHandler        *handler.StorageHandler
+	videoHandler          *handler.VideoHandler
+	whiteboardHandler     *handler.WhiteboardHandler
 	jwtManager            *auth.JWTManager
 }
 
@@ -104,6 +106,8 @@ func New(cfg *config.Config, db *gorm.DB) *Server {
 		meetingHandler:        meetingHandler,
 		calendarHandler:       calendarHandler,
 		storageHandler:        storageHandler,
+		videoHandler:          handler.NewVideoHandler(cfg, db),
+		whiteboardHandler:     handler.NewWhiteboardHandler(db),
 		jwtManager:            jwtManager,
 	}
 }
@@ -218,6 +222,13 @@ func (s *Server) SetupRoutes() {
 	workspaceGroup.Post("/:workspaceId/files/presign", s.storageHandler.GetPresignedURL)
 	workspaceGroup.Post("/:workspaceId/files/confirm", s.storageHandler.ConfirmUpload)
 	workspaceGroup.Get("/:workspaceId/files/:fileId/download", s.storageHandler.GetDownloadURL)
+
+	// Video Call 라우트
+	s.app.Post("/api/video/token", auth.AuthMiddleware(s.jwtManager), s.videoHandler.GenerateToken)
+
+	// Whiteboard 라우트
+	s.app.Get("/api/whiteboard", s.whiteboardHandler.GetWhiteboard)
+	s.app.Post("/api/whiteboard", s.whiteboardHandler.HandleWhiteboard)
 
 	// WebSocket 업그레이드 체크 미들웨어
 	s.app.Use("/ws", func(c *fiber.Ctx) error {

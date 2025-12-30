@@ -1,7 +1,8 @@
-"use client";
+'use client';
 
 import { useState, useEffect, useCallback } from "react";
 import { apiClient, Meeting } from "../../../lib/api";
+import VideoCallFeature from "./VideoCallFeature";
 
 interface CallsSectionProps {
   workspaceId: number;
@@ -15,29 +16,51 @@ export default function CallsSection({ workspaceId, channelId }: CallsSectionPro
   const [showCreateModal, setShowCreateModal] = useState(false);
   const [newMeetingTitle, setNewMeetingTitle] = useState("");
   const [isCreating, setIsCreating] = useState(false);
+  const [isJoining, setIsJoining] = useState(false);
+
+  // channelId에서 카테고리 추출 (예: call-general -> GENERAL)
+  // 기본값은 GENERAL
+  const currentCategory = channelId?.replace("call-", "").toUpperCase() || "GENERAL";
+
+  // 카테고리별 표시할 타이틀 매핑
+  const categoryTitle = {
+    GENERAL: "일반 통화",
+    STANDUP: "스탠드업 미팅",
+    BRAINSTORMING: "브레인스토밍",
+  }[currentCategory] || "통화";
 
   const loadMeetings = useCallback(async () => {
     try {
       setIsLoading(true);
       const response = await apiClient.getWorkspaceMeetings(workspaceId);
-      setMeetings(response.meetings);
 
-      // channelId가 있으면 해당 미팅 선택
-      if (channelId && channelId.startsWith("call-")) {
-        const meetingId = parseInt(channelId.replace("call-", ""));
-        const meeting = response.meetings.find((m) => m.id === meetingId);
-        if (meeting) setSelectedMeeting(meeting);
+      // 카테고리에 맞는 미팅만 필터링
+      const filteredMeetings = response.meetings.filter(meeting => {
+        // 기존 데이터(VIDEO 타입 등)는 GENERAL로 취급
+        const type = meeting.type || "GENERAL";
+        const normalizedType = type === "VIDEO" ? "GENERAL" : type;
+
+        return normalizedType === currentCategory;
+      });
+
+      setMeetings(filteredMeetings);
+
+      // 선택된 미팅이 없거나 현재 카테고리에 없는 경우, 첫 번째 미팅 선택 (선택 사항)
+      if (filteredMeetings.length > 0 && !selectedMeeting) {
+        // setSelectedMeeting(filteredMeetings[0]); 
       }
+
     } catch (error) {
       console.error("Failed to load meetings:", error);
     } finally {
       setIsLoading(false);
     }
-  }, [workspaceId, channelId]);
+  }, [workspaceId, currentCategory]);
 
   useEffect(() => {
     loadMeetings();
-  }, [loadMeetings]);
+    setSelectedMeeting(null); // 카테고리 변경 시 선택 초기화
+  }, [loadMeetings, currentCategory]);
 
   const handleCreateMeeting = async () => {
     if (!newMeetingTitle.trim() || isCreating) return;
@@ -46,7 +69,7 @@ export default function CallsSection({ workspaceId, channelId }: CallsSectionPro
       setIsCreating(true);
       const meeting = await apiClient.createMeeting(workspaceId, {
         title: newMeetingTitle.trim(),
-        type: "VIDEO",
+        type: currentCategory, // 현재 카테고리 타입으로 생성
       });
       setMeetings((prev) => [meeting, ...prev]);
       setNewMeetingTitle("");
@@ -72,6 +95,7 @@ export default function CallsSection({ workspaceId, channelId }: CallsSectionPro
   const handleEndMeeting = async (meeting: Meeting) => {
     try {
       await apiClient.endMeeting(workspaceId, meeting.id);
+      // 종료 후 목록 전체를 다시 불러오는 대신, 해당 아이템만 상태 업데이트 (더 부드러운 UX)
       await loadMeetings();
     } catch (error) {
       console.error("Failed to end meeting:", error);
@@ -104,13 +128,28 @@ export default function CallsSection({ workspaceId, channelId }: CallsSectionPro
     );
   }
 
+  if (isJoining && selectedMeeting) {
+    return (
+      <div className="h-full bg-white relative">
+        <VideoCallFeature
+          roomId={`meeting-${selectedMeeting.id}`}
+          roomTitle={selectedMeeting.title}
+          onLeave={() => {
+            setIsJoining(false);
+            loadMeetings();
+          }}
+        />
+      </div>
+    );
+  }
+
   return (
     <div className="h-full flex">
       {/* Meeting List */}
       <div className="w-80 border-r border-black/5 flex flex-col">
         <div className="px-6 py-5 border-b border-black/5">
-          <h1 className="text-xl font-semibold text-black">통화방</h1>
-          <p className="text-sm text-black/40 mt-0.5">{meetings.length}개의 통화방</p>
+          <h1 className="text-xl font-semibold text-black">{categoryTitle}</h1>
+          <p className="text-sm text-black/40 mt-0.5">{meetings.length}개의 {categoryTitle}</p>
         </div>
 
         <div className="flex-1 overflow-y-auto p-4">
@@ -119,18 +158,16 @@ export default function CallsSection({ workspaceId, channelId }: CallsSectionPro
               <button
                 key={meeting.id}
                 onClick={() => setSelectedMeeting(meeting)}
-                className={`w-full p-4 rounded-xl text-left transition-all ${
-                  selectedMeeting?.id === meeting.id
-                    ? "bg-black text-white"
-                    : "bg-black/[0.02] hover:bg-black/[0.05]"
-                }`}
+                className={`w-full p-4 rounded-xl text-left transition-all ${selectedMeeting?.id === meeting.id
+                  ? "bg-black text-white"
+                  : "bg-black/[0.02] hover:bg-black/[0.05]"
+                  }`}
               >
                 <div className="flex items-center justify-between mb-2">
                   <div className="flex items-center gap-2">
                     <svg
-                      className={`w-5 h-5 ${
-                        selectedMeeting?.id === meeting.id ? "text-white/70" : "text-black/40"
-                      }`}
+                      className={`w-5 h-5 ${selectedMeeting?.id === meeting.id ? "text-white/70" : "text-black/40"
+                        }`}
                       fill="none"
                       stroke="currentColor"
                       viewBox="0 0 24 24"
@@ -142,7 +179,7 @@ export default function CallsSection({ workspaceId, channelId }: CallsSectionPro
                         d="M15.536 8.464a5 5 0 010 7.072m2.828-9.9a9 9 0 010 12.728M5.586 15H4a1 1 0 01-1-1v-4a1 1 0 011-1h1.586l4.707-4.707C10.923 3.663 12 4.109 12 5v14c0 .891-1.077 1.337-1.707.707L5.586 15z"
                       />
                     </svg>
-                    <span className="font-medium truncate">{meeting.title}</span>
+                    <span className={`font-medium truncate ${selectedMeeting?.id === meeting.id ? "text-white" : "text-black"}`}>{meeting.title}</span>
                   </div>
                   {meeting.status === "IN_PROGRESS" && (
                     <span className="w-2 h-2 rounded-full bg-green-400 animate-pulse" />
@@ -150,17 +187,15 @@ export default function CallsSection({ workspaceId, channelId }: CallsSectionPro
                 </div>
 
                 <div className="flex items-center gap-2">
-                  <span className={`px-2 py-0.5 text-xs rounded-full ${
-                    selectedMeeting?.id === meeting.id
-                      ? "bg-white/20 text-white/80"
-                      : `${getStatusColor(meeting.status)} text-white`
-                  }`}>
+                  <span className={`px-2 py-0.5 text-xs rounded-full ${selectedMeeting?.id === meeting.id
+                    ? "bg-white/20 text-white/80"
+                    : `${getStatusColor(meeting.status)} text-white`
+                    }`}>
                     {getStatusLabel(meeting.status)}
                   </span>
                   {meeting.participants && meeting.participants.length > 0 && (
-                    <span className={`text-xs ${
-                      selectedMeeting?.id === meeting.id ? "text-white/60" : "text-black/40"
-                    }`}>
+                    <span className={`text-xs ${selectedMeeting?.id === meeting.id ? "text-white/60" : "text-black/40"
+                      }`}>
                       {meeting.participants.length}명 참여
                     </span>
                   )}
@@ -177,7 +212,7 @@ export default function CallsSection({ workspaceId, channelId }: CallsSectionPro
             <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
               <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M12 4v16m8-8H4" />
             </svg>
-            <span className="text-sm font-medium">새 통화방 만들기</span>
+            <span className="text-sm font-medium">새 {categoryTitle} 만들기</span>
           </button>
         </div>
       </div>
@@ -206,14 +241,27 @@ export default function CallsSection({ workspaceId, channelId }: CallsSectionPro
                     시작하기
                   </button>
                 )}
+                {/* 진행 중 상태에서는 참여하기/종료하기 버튼 제공 */}
                 {selectedMeeting.status === "IN_PROGRESS" && (
-                  <button
-                    onClick={() => handleEndMeeting(selectedMeeting)}
-                    className="px-4 py-2 bg-red-500 text-white text-sm font-medium rounded-lg hover:bg-red-600 transition-colors flex items-center gap-2"
-                  >
-                    종료하기
-                  </button>
+                  <div className="flex gap-2">
+                    <button
+                      onClick={() => setIsJoining(true)}
+                      className="px-4 py-2 bg-black text-white text-sm font-medium rounded-lg hover:bg-black/80 transition-colors flex items-center gap-2 shadow-sm"
+                    >
+                      <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 10l4.553-2.276A1 1 0 0121 8.618v6.764a1 1 0 01-1.447.894L15 14M5 18h8a2 2 0 002-2V8a2 2 0 00-2-2H5a2 2 0 00-2 2v8a2 2 0 002 2z" />
+                      </svg>
+                      참여하기
+                    </button>
+                    <button
+                      onClick={() => handleEndMeeting(selectedMeeting)}
+                      className="px-4 py-2 border border-red-200 text-red-500 text-sm font-medium rounded-lg hover:bg-red-50 transition-colors"
+                    >
+                      종료하기
+                    </button>
+                  </div>
                 )}
+                {/* 종료된 회의라도 다시 시작하거나 참여할 수 없도록 처리하지만, 필요하다면 여기에 로직 추가 */}
               </div>
             </div>
 
@@ -257,7 +305,7 @@ export default function CallsSection({ workspaceId, channelId }: CallsSectionPro
                     아직 참가자가 없습니다
                   </h3>
                   <p className="text-sm text-black/40 mb-6">
-                    미팅을 시작하여 참가자를 초대하세요
+                    {selectedMeeting.status === "IN_PROGRESS" ? "참여하기 버튼을 눌러 회의에 참여하세요" : "미팅을 시작하여 참가자를 초대하세요"}
                   </p>
                 </div>
               )}
@@ -271,10 +319,10 @@ export default function CallsSection({ workspaceId, channelId }: CallsSectionPro
               </svg>
             </div>
             <h3 className="text-xl font-medium text-black/60 mb-2">
-              통화방을 선택하세요
+              {categoryTitle}을 선택하세요
             </h3>
             <p className="text-sm text-black/40 max-w-sm">
-              왼쪽에서 통화방을 선택하거나 새로운 통화방을 만들어 팀원들과 소통하세요
+              왼쪽에서 통화방을 선택하거나 새로운 {categoryTitle}을 만들어 팀원들과 소통하세요
             </p>
           </div>
         )}
@@ -284,19 +332,20 @@ export default function CallsSection({ workspaceId, channelId }: CallsSectionPro
       {showCreateModal && (
         <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50">
           <div className="bg-white rounded-2xl p-6 w-full max-w-md">
-            <h2 className="text-xl font-semibold text-black mb-4">새 통화방 만들기</h2>
+            <h2 className="text-xl font-semibold text-black mb-4">새 {categoryTitle} 만들기</h2>
             <input
               type="text"
               value={newMeetingTitle}
               onChange={(e) => setNewMeetingTitle(e.target.value)}
               placeholder="통화방 이름"
-              className="w-full px-4 py-3 border border-black/10 rounded-lg mb-4 focus:outline-none focus:ring-2 focus:ring-black/10"
+              className="w-full px-4 py-3 border border-black/10 rounded-lg mb-4 focus:outline-none focus:ring-2 focus:ring-black/10 text-black placeholder-black/30"
               autoFocus
             />
             <div className="flex gap-3">
               <button
                 onClick={() => setShowCreateModal(false)}
                 className="flex-1 py-3 text-black/60 hover:text-black transition-colors"
+                title="취소"
               >
                 취소
               </button>
@@ -304,6 +353,7 @@ export default function CallsSection({ workspaceId, channelId }: CallsSectionPro
                 onClick={handleCreateMeeting}
                 disabled={!newMeetingTitle.trim() || isCreating}
                 className="flex-1 py-3 bg-black text-white rounded-lg hover:bg-black/80 transition-colors disabled:opacity-50"
+                title="만들기"
               >
                 {isCreating ? "생성 중..." : "만들기"}
               </button>
