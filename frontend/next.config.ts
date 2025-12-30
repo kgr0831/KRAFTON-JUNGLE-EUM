@@ -5,6 +5,14 @@ const nextConfig: NextConfig = {
   images: {
     unoptimized: true,
   },
+  async rewrites() {
+    return [
+      {
+        source: "/uploads/:path*",
+        destination: "http://localhost:8080/uploads/:path*",
+      },
+    ];
+  },
 };
 
 export default nextConfig;

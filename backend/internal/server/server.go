@@ -37,6 +37,7 @@ type Server struct {
 	meetingHandler        *handler.MeetingHandler
 	calendarHandler       *handler.CalendarHandler
 	storageHandler        *handler.StorageHandler
+	roleHandler           *handler.RoleHandler
 	videoHandler          *handler.VideoHandler
 	whiteboardHandler     *handler.WhiteboardHandler
 	jwtManager            *auth.JWTManager
@@ -75,6 +76,9 @@ func New(cfg *config.Config, db *gorm.DB) *Server {
 	chatWSHandler := handler.NewChatWSHandler(db)
 	meetingHandler := handler.NewMeetingHandler(db)
 	calendarHandler := handler.NewCalendarHandler(db)
+	roleHandler := handler.NewRoleHandler(db)
+	videoHandler := handler.NewVideoHandler(cfg, db)
+	whiteboardHandler := handler.NewWhiteboardHandler(db)
 
 	// S3 서비스 초기화 (선택적)
 	var s3Service *storage.S3Service
@@ -106,8 +110,9 @@ func New(cfg *config.Config, db *gorm.DB) *Server {
 		meetingHandler:        meetingHandler,
 		calendarHandler:       calendarHandler,
 		storageHandler:        storageHandler,
-		videoHandler:          handler.NewVideoHandler(cfg, db),
-		whiteboardHandler:     handler.NewWhiteboardHandler(db),
+		roleHandler:           roleHandler,
+		videoHandler:          videoHandler,
+		whiteboardHandler:     whiteboardHandler,
 		jwtManager:            jwtManager,
 	}
 }
@@ -133,16 +138,16 @@ func (s *Server) SetupMiddleware() {
 		AllowMethods:     "GET, POST, PUT, DELETE, OPTIONS",
 		AllowCredentials: true,
 	}))
+
+	// 정적 파일 제공 (업로드된 파일)
+	s.app.Static("/uploads", "./uploads")
 }
 
 // SetupRoutes 라우트 설정
 func (s *Server) SetupRoutes() {
 	// 헬스체크 엔드포인트
 	s.app.Get("/health", func(c *fiber.Ctx) error {
-		return c.JSON(fiber.Map{
-			"status":    "ok",
-			"timestamp": time.Now().Unix(),
-		})
+		return c.SendStatus(fiber.StatusOK)
 	})
 
 	// Rate Limiter 설정 (인증 엔드포인트용 - Brute Force 방지)
@@ -165,6 +170,7 @@ func (s *Server) SetupRoutes() {
 	authGroup.Post("/refresh", authLimiter, s.authHandler.RefreshToken)
 	authGroup.Post("/logout", auth.AuthMiddleware(s.jwtManager), s.authHandler.Logout) // 인증된 사용자만
 	authGroup.Get("/me", auth.AuthMiddleware(s.jwtManager), s.authHandler.GetMe)
+	authGroup.Put("/me", auth.AuthMiddleware(s.jwtManager), s.userHandler.UpdateUser)
 
 	// User 라우트 그룹 (인증 필요)
 	userGroup := s.app.Group("/api/users", auth.AuthMiddleware(s.jwtManager))
@@ -183,7 +189,17 @@ func (s *Server) SetupRoutes() {
 	workspaceGroup.Get("/", s.workspaceHandler.GetMyWorkspaces)
 	workspaceGroup.Get("/:id", s.workspaceHandler.GetWorkspace)
 	workspaceGroup.Post("/:id/members", s.workspaceHandler.AddMembers)
+	workspaceGroup.Post("/:id/members", s.workspaceHandler.AddMembers)
 	workspaceGroup.Delete("/:id/leave", s.workspaceHandler.LeaveWorkspace)
+	workspaceGroup.Put("/:id/members/:userId/role", s.workspaceHandler.UpdateMemberRole)
+	workspaceGroup.Put("/:id", s.workspaceHandler.UpdateWorkspace)
+	workspaceGroup.Delete("/:id", s.workspaceHandler.DeleteWorkspace)
+
+	// Role 라우트 (워크스페이스 하위)
+	workspaceGroup.Get("/:id/roles", s.roleHandler.GetRoles)
+	workspaceGroup.Post("/:id/roles", s.roleHandler.CreateRole)
+	workspaceGroup.Put("/:id/roles/:roleId", s.roleHandler.UpdateRole)
+	workspaceGroup.Delete("/:id/roles/:roleId", s.roleHandler.DeleteRole)
 
 	// Chat 라우트 (워크스페이스 하위) - 레거시
 	workspaceGroup.Get("/:workspaceId/chats", s.chatHandler.GetWorkspaceChats)
@@ -325,6 +341,7 @@ func (s *Server) SetupRoutes() {
 		s.db.Table("users").Select("nickname").Where("id = ?", claims.UserID).Scan(&user)
 
 		c.Locals("roomId", int64(roomID))
+		c.Locals("workspaceId", int64(workspaceID))
 		c.Locals("userId", claims.UserID)
 		c.Locals("nickname", user.Nickname)
 

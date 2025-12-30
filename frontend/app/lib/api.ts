@@ -31,6 +31,13 @@ interface WorkspaceMember {
   status: 'PENDING' | 'ACTIVE'; // Required field with union type
   joined_at: string;
   user?: UserSearchResult;
+  role?: {
+    id: number;
+    name: string;
+    color?: string;
+    is_default: boolean;
+    permissions: string[];
+  };
 }
 
 interface Workspace {
@@ -50,6 +57,15 @@ interface WorkspacesResponse {
 interface CreateWorkspaceRequest {
   name: string;
   member_ids?: number[];
+}
+
+interface Role {
+  id: number;
+  workspace_id: number;
+  name: string;
+  color?: string;
+  is_default: boolean;
+  permissions?: { permission_code: string }[];
 }
 
 // 채팅 관련 타입
@@ -222,10 +238,15 @@ class ApiClient {
     options: RequestInit = {},
     skipAutoRefresh: boolean = false
   ): Promise<T> {
-    const headers: HeadersInit = {
+    const headers: Record<string, string> = {
       'Content-Type': 'application/json',
-      ...options.headers,
+      ...(options.headers as Record<string, string>),
     };
+
+    // FormData인 경우 Content-Type 헤더 제거 (브라우저가 자동으로 boundary 설정)
+    if (options.body instanceof FormData) {
+      delete headers['Content-Type'];
+    }
 
     const response = await fetch(`${API_BASE_URL}${endpoint}`, {
       ...options,
@@ -316,6 +337,26 @@ class ApiClient {
     }
   }
 
+  // 프로필 수정
+  async updateProfile(data: FormData | { nickname: string; profile_img?: string }): Promise<AuthResponse['user']> {
+    let body: BodyInit;
+    const headers: HeadersInit = {};
+
+    if (data instanceof FormData) {
+      body = data;
+      // Content-Type header should be let empty for FormData to let the browser set it with boundary
+    } else {
+      body = JSON.stringify(data);
+      headers['Content-Type'] = 'application/json';
+    }
+
+    return this.request<AuthResponse['user']>('/auth/me', {
+      method: 'PUT',
+      body,
+      headers,
+    });
+  }
+
   // 유저 검색 (닉네임 또는 이메일)
   async searchUsers(query: string): Promise<SearchUsersResponse> {
     if (query.length < 2) {
@@ -356,6 +397,53 @@ class ApiClient {
   async leaveWorkspace(workspaceId: number): Promise<{ message: string }> {
     return this.request(`/api/workspaces/${workspaceId}/leave`, {
       method: 'DELETE',
+    });
+  }
+
+  // 워크스페이스 수정
+  async updateWorkspace(workspaceId: number, name: string): Promise<Workspace> {
+    return this.request<Workspace>(`/api/workspaces/${workspaceId}`, {
+      method: 'PUT',
+      body: JSON.stringify({ name }),
+    });
+  }
+
+  // 워크스페이스 삭제
+  async deleteWorkspace(workspaceId: number): Promise<void> {
+    await this.request(`/api/workspaces/${workspaceId}`, {
+      method: 'DELETE',
+    });
+  }
+
+  // ========== 역할(Role) API ==========
+  async getRoles(workspaceId: number): Promise<Role[]> {
+    return this.request<Role[]>(`/api/workspaces/${workspaceId}/roles`);
+  }
+
+  async createRole(workspaceId: number, name: string, color?: string, permissions?: string[]): Promise<Role> {
+    return this.request<Role>(`/api/workspaces/${workspaceId}/roles`, {
+      method: "POST",
+      body: JSON.stringify({ name, color, permissions }),
+    });
+  }
+
+  async updateRole(workspaceId: number, roleId: number, name: string, color?: string, permissions?: string[]): Promise<Role> {
+    return this.request<Role>(`/api/workspaces/${workspaceId}/roles/${roleId}`, {
+      method: "PUT",
+      body: JSON.stringify({ name, color, permissions }),
+    });
+  }
+
+  async deleteRole(workspaceId: number, roleId: number): Promise<void> {
+    await this.request(`/api/workspaces/${workspaceId}/roles/${roleId}`, {
+      method: 'DELETE',
+    });
+  }
+
+  async updateMemberRole(workspaceId: number, userId: number, roleId: number): Promise<void> {
+    await this.request(`/api/workspaces/${workspaceId}/members/${userId}/role`, {
+      method: 'PUT',
+      body: JSON.stringify({ role_id: roleId }),
     });
   }
 
@@ -641,4 +729,6 @@ export type {
   // Notification
   Notification,
   NotificationsResponse,
+  // Role
+  Role,
 };
