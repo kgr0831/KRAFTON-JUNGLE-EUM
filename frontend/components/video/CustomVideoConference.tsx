@@ -33,7 +33,7 @@ export default function CustomVideoConference({
 }: CustomVideoConferenceProps) {
     const connectionState = useConnectionState();
     const participants = useParticipants();
-    const { localParticipant } = useLocalParticipant();
+    const { localParticipant, isMicrophoneEnabled, isCameraEnabled, isScreenShareEnabled } = useLocalParticipant();
 
     const tracks = useTracks(
         [
@@ -83,6 +83,12 @@ export default function CustomVideoConference({
                 <ControlBarComponent
                     isChatOpen={isChatOpen}
                     unreadCount={unreadCount}
+                    isMicEnabled={isMicrophoneEnabled}
+                    isCamEnabled={isCameraEnabled}
+                    isScreenEnabled={isScreenShareEnabled}
+                    onToggleMic={() => localParticipant.setMicrophoneEnabled(!isMicrophoneEnabled)}
+                    onToggleCam={() => localParticipant.setCameraEnabled(!isCameraEnabled)}
+                    onToggleScreen={() => localParticipant.setScreenShareEnabled(!isScreenShareEnabled)}
                     onToggleChat={onToggleChat}
                     onToggleWhiteboard={onToggleWhiteboard}
                     onLeave={onLeave}
@@ -107,6 +113,12 @@ export default function CustomVideoConference({
             <ControlBarComponent
                 isChatOpen={isChatOpen}
                 unreadCount={unreadCount}
+                isMicEnabled={isMicrophoneEnabled}
+                isCamEnabled={isCameraEnabled}
+                isScreenEnabled={isScreenShareEnabled}
+                onToggleMic={() => localParticipant.setMicrophoneEnabled(!isMicrophoneEnabled)}
+                onToggleCam={() => localParticipant.setCameraEnabled(!isCameraEnabled)}
+                onToggleScreen={() => localParticipant.setScreenShareEnabled(!isScreenShareEnabled)}
                 onToggleChat={onToggleChat}
                 onToggleWhiteboard={onToggleWhiteboard}
                 onLeave={onLeave}
@@ -119,12 +131,24 @@ export default function CustomVideoConference({
 function ControlBarComponent({
     isChatOpen,
     unreadCount,
+    isMicEnabled,
+    isCamEnabled,
+    isScreenEnabled,
+    onToggleMic,
+    onToggleCam,
+    onToggleScreen,
     onToggleChat,
     onToggleWhiteboard,
     onLeave,
 }: {
     isChatOpen?: boolean;
     unreadCount?: number;
+    isMicEnabled?: boolean;
+    isCamEnabled?: boolean;
+    isScreenEnabled?: boolean;
+    onToggleMic?: () => void;
+    onToggleCam?: () => void;
+    onToggleScreen?: () => void;
     onToggleChat?: () => void;
     onToggleWhiteboard?: () => void;
     onLeave?: () => void;
@@ -133,50 +157,81 @@ function ControlBarComponent({
         <div className="flex-shrink-0 px-6 py-5 border-t border-black/5">
             <div className="flex items-center justify-center gap-2">
                 {/* 마이크 */}
-                <TrackToggle
-                    source={Track.Source.Microphone}
-                    className="p-3.5 rounded-xl bg-black/5 hover:bg-black/10 text-black transition-colors data-[lk-muted=true]:bg-black data-[lk-muted=true]:text-white"
+                <button
+                    onClick={onToggleMic}
+                    className="p-3.5 rounded-xl !bg-transparent hover:bg-black/10 !text-black transition-colors"
                 >
-                    <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M19 11a7 7 0 01-7 7m0 0a7 7 0 01-7-7m7 7v4m0 0H8m4 0h4m-4-8a3 3 0 01-3-3V5a3 3 0 116 0v6a3 3 0 01-3 3z" />
-                    </svg>
-                </TrackToggle>
+                    {isMicEnabled ? (
+                        /* On (Filled) */
+                        <svg className="w-5 h-5" fill="currentColor" viewBox="0 0 24 24">
+                            <path d="M12 14c1.66 0 3-1.34 3-3V5c0-1.66-1.34-3-3-3S9 3.34 9 5v6c0 1.66 1.34 3 3 3z" />
+                            <path d="M17 11c0 2.76-2.24 5-5 5s-5-2.24-5-5H5c0 3.53 2.61 6.43 6 6.92V21h2v-3.08c3.39-.49 6-3.39 6-6.92h-2z" />
+                        </svg>
+                    ) : (
+                        /* Off (Outlined) */
+                        <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M19 11a7 7 0 01-7 7m0 0a7 7 0 01-7-7m7 7v4m0 0H8m4 0h4m-4-8a3 3 0 01-3-3V5a3 3 0 116 0v6a3 3 0 01-3 3z" />
+                        </svg>
+                    )}
+                </button>
 
                 {/* 카메라 */}
-                <TrackToggle
-                    source={Track.Source.Camera}
-                    className="p-3.5 rounded-xl bg-black/5 hover:bg-black/10 text-black transition-colors data-[lk-muted=true]:bg-black data-[lk-muted=true]:text-white"
+                <button
+                    onClick={onToggleCam}
+                    className="p-3.5 rounded-xl !bg-transparent hover:bg-black/10 !text-black transition-colors"
                 >
-                    <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M15 10l4.553-2.276A1 1 0 0121 8.618v6.764a1 1 0 01-1.447.894L15 14M5 18h8a2 2 0 002-2V8a2 2 0 00-2-2H5a2 2 0 00-2 2v8a2 2 0 002 2z" />
-                    </svg>
-                </TrackToggle>
+                    {isCamEnabled ? (
+                        /* On (Filled) */
+                        <svg className="w-5 h-5" fill="currentColor" viewBox="0 0 24 24">
+                            <path d="M15 10l4.553-2.276A1 1 0 0121 8.618v6.764a1 1 0 01-1.447.894L15 14M5 18h8a2 2 0 002-2V8a2 2 0 00-2-2H5a2 2 0 00-2 2v8a2 2 0 002 2z" />
+                        </svg>
+                    ) : (
+                        /* Off (Outlined) */
+                        <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M15 10l4.553-2.276A1 1 0 0121 8.618v6.764a1 1 0 01-1.447.894L15 14M5 18h8a2 2 0 002-2V8a2 2 0 00-2-2H5a2 2 0 00-2 2v8a2 2 0 002 2z" />
+                        </svg>
+                    )}
+                </button>
 
                 {/* 화면 공유 */}
-                <TrackToggle
-                    source={Track.Source.ScreenShare}
-                    className="p-3.5 rounded-xl bg-black/5 hover:bg-black/10 text-black transition-colors data-[lk-enabled=true]:bg-black data-[lk-enabled=true]:text-white"
+                <button
+                    onClick={onToggleScreen}
+                    className="p-3.5 rounded-xl !bg-transparent hover:bg-black/10 !text-black transition-colors"
                 >
-                    <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M9.75 17L9 20l-1 1h8l-1-1-.75-3M3 13h18M5 17h14a2 2 0 002-2V5a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z" />
-                    </svg>
-                </TrackToggle>
+                    {isScreenEnabled ? (
+                        /* On (Sharing) - Filled Arrow Box */
+                        <svg className="w-5 h-5" fill="currentColor" viewBox="0 0 24 24">
+                            <path d="M20 3H4a2 2 0 00-2 2v10a2 2 0 002 2h4v2.5a.5.5 0 00.5.5h7a.5.5 0 00.5-.5V17h4a2 2 0 002-2V5a2 2 0 00-2-2zm-8 9.5l-4-4h2.5V5h3v3.5H16l-4 4z" />
+                        </svg>
+                    ) : (
+                        /* Off (Not Sharing) - Outlined Monitor */
+                        <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M9.75 17L9 20l-1 1h8l-1-1-.75-3M3 13h18M5 17h14a2 2 0 002-2V5a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z" />
+                        </svg>
+                    )}
+                </button>
 
                 <div className="w-px h-8 bg-black/10 mx-2" />
 
                 {/* 채팅 */}
                 <button
                     onClick={onToggleChat}
-                    className={`relative p-3.5 rounded-xl transition-colors ${
-                        isChatOpen ? 'bg-black text-white' : 'bg-black/5 hover:bg-black/10 text-black'
-                    }`}
+                    className="relative p-3.5 rounded-xl !bg-transparent hover:bg-black/10 !text-black transition-colors"
                 >
-                    <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M8 12h.01M12 12h.01M16 12h.01M21 12c0 4.418-4.03 8-9 8a9.863 9.863 0 01-4.255-.949L3 20l1.395-3.72C3.512 15.042 3 13.574 3 12c0-4.418 4.03-8 9-8s9 3.582 9 8z" />
-                    </svg>
-                    {unreadCount && unreadCount > 0 && !isChatOpen && (
+                    {isChatOpen ? (
+                        /* On (Open) - Filled Chat Bubble */
+                        <svg className="w-5 h-5" fill="currentColor" viewBox="0 0 24 24">
+                            <path d="M2.003 5.884C2.003 3.743 3.791 2 6 2h12a4 4 0 014 4v10a4 4 0 01-4 4H6.877l-2.022 1.942a1 1 0 01-1.691-.72V18.5A2.5 2.5 0 012 16.035v-10.15zM13.5 9h-3a1 1 0 100 2h3a1 1 0 100-2zm-3 4h3a1 1 0 100 2h-3a1 1 0 100-2z" />
+                        </svg>
+                    ) : (
+                        /* Off (Closed) - Outlined Chat Bubble */
+                        <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M8 12h.01M12 12h.01M16 12h.01M21 12c0 4.418-4.03 8-9 8a9.863 9.863 0 01-4.255-.949L3 20l1.395-3.72C3.512 15.042 3 13.574 3 12c0-4.418 4.03-8 9-8s9 3.582 9 8z" />
+                        </svg>
+                    )}
+                    {(unreadCount ?? 0) > 0 && !isChatOpen && (
                         <span className="absolute -top-1 -right-1 w-5 h-5 bg-black text-white text-[10px] rounded-full flex items-center justify-center font-medium">
-                            {unreadCount > 9 ? '9+' : unreadCount}
+                            {(unreadCount ?? 0) > 9 ? '9+' : unreadCount}
                         </span>
                     )}
                 </button>
@@ -184,7 +239,7 @@ function ControlBarComponent({
                 {/* 화이트보드 */}
                 <button
                     onClick={onToggleWhiteboard}
-                    className="p-3.5 rounded-xl bg-black/5 hover:bg-black/10 text-black transition-colors"
+                    className="p-3.5 rounded-xl !bg-transparent hover:bg-black/10 !text-black transition-colors"
                 >
                     <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                         <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M15.232 5.232l3.536 3.536m-2.036-5.036a2.5 2.5 0 113.536 3.536L6.5 21.036H3v-3.572L16.732 3.732z" />
@@ -196,7 +251,7 @@ function ControlBarComponent({
                 {/* 나가기 */}
                 <DisconnectButton
                     onClick={onLeave}
-                    className="px-5 py-3 rounded-xl border border-black/10 hover:bg-black hover:text-white hover:border-black text-black transition-colors font-medium text-sm flex items-center gap-2"
+                    className="px-5 py-3 rounded-xl border border-black/20 hover:bg-black hover:text-white hover:border-black !text-black transition-colors font-medium text-sm flex items-center gap-2"
                 >
                     <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                         <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M17 16l4-4m0 0l-4-4m4 4H7m6 4v1a3 3 0 01-3 3H6a3 3 0 01-3-3V7a3 3 0 013-3h4a3 3 0 013 3v1" />
