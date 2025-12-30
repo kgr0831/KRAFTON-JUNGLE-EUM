@@ -2,7 +2,7 @@
 
 import { useEffect, useRef, useState, useCallback } from 'react';
 import { useRoomContext, useLocalParticipant } from '@livekit/components-react';
-import { RoomEvent, DataPacket_Kind } from 'livekit-client';
+import { RoomEvent } from 'livekit-client';
 
 interface ChatMessage {
     id: string;
@@ -27,7 +27,6 @@ export default function ChatPanel({ roomId, onClose, onNewMessage }: ChatPanelPr
     const messagesEndRef = useRef<HTMLDivElement>(null);
     const inputRef = useRef<HTMLInputElement>(null);
 
-    // Auto scroll to bottom
     const scrollToBottom = useCallback(() => {
         messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
     }, []);
@@ -36,12 +35,10 @@ export default function ChatPanel({ roomId, onClose, onNewMessage }: ChatPanelPr
         scrollToBottom();
     }, [messages, scrollToBottom]);
 
-    // Focus input on mount
     useEffect(() => {
         inputRef.current?.focus();
     }, []);
 
-    // Load existing messages from Redis on mount
     useEffect(() => {
         const loadMessages = async () => {
             try {
@@ -66,7 +63,6 @@ export default function ChatPanel({ roomId, onClose, onNewMessage }: ChatPanelPr
         }
     }, [roomId, localParticipant]);
 
-    // Listen for incoming messages
     useEffect(() => {
         if (!room) return;
 
@@ -85,7 +81,7 @@ export default function ChatPanel({ roomId, onClose, onNewMessage }: ChatPanelPr
                     onNewMessage?.();
                 }
             } catch (e) {
-                // Ignore non-chat messages (e.g., whiteboard data)
+                // Ignore non-chat messages
             }
         };
 
@@ -95,7 +91,6 @@ export default function ChatPanel({ roomId, onClose, onNewMessage }: ChatPanelPr
         };
     }, [room, localParticipant?.identity, onNewMessage]);
 
-    // Send message
     const sendMessage = useCallback(async () => {
         if (!input.trim() || !room || !localParticipant) return;
 
@@ -108,20 +103,17 @@ export default function ChatPanel({ roomId, onClose, onNewMessage }: ChatPanelPr
         };
 
         try {
-            // Publish via LiveKit for real-time
             await localParticipant.publishData(
                 new TextEncoder().encode(JSON.stringify(message)),
                 { reliable: true }
             );
 
-            // Save to Redis for persistence
             await fetch('/api/chat', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ roomId, message }),
             });
 
-            // Add own message to list
             setMessages((prev) => [...prev, { ...message, isOwn: true }]);
             setInput('');
         } catch (e) {
@@ -129,7 +121,6 @@ export default function ChatPanel({ roomId, onClose, onNewMessage }: ChatPanelPr
         }
     }, [input, room, localParticipant, roomId]);
 
-    // Handle Enter key
     const handleKeyDown = (e: React.KeyboardEvent) => {
         if (e.key === 'Enter' && !e.shiftKey) {
             e.preventDefault();
@@ -137,7 +128,6 @@ export default function ChatPanel({ roomId, onClose, onNewMessage }: ChatPanelPr
         }
     };
 
-    // Format timestamp
     const formatTime = (ts: number) => {
         return new Date(ts).toLocaleTimeString('ko-KR', {
             hour: '2-digit',
@@ -146,28 +136,34 @@ export default function ChatPanel({ roomId, onClose, onNewMessage }: ChatPanelPr
     };
 
     return (
-        <div className="h-full flex flex-col bg-white/90 backdrop-blur-xl rounded-2xl overflow-hidden border border-black/5 shadow-2xl animate-in slide-in-from-right duration-300">
+        <div className="h-full flex flex-col bg-white border-l border-black/5">
             {/* Header */}
-            <div className="flex-shrink-0 flex items-center justify-between px-4 py-3 bg-white/50 border-b border-black/5">
-                <div className="flex items-center gap-2">
-                    <span className="text-xl">💬</span>
-                    <span className="text-stone-900 font-bold">채팅</span>
-                </div>
+            <div className="flex-shrink-0 flex items-center justify-between px-5 py-4 border-b border-black/5">
+                <span className="text-black font-medium">채팅</span>
                 <button
                     onClick={onClose}
-                    className="text-stone-400 hover:text-stone-900 transition-colors p-1"
+                    className="p-2 text-black/40 hover:text-black hover:bg-black/5 rounded-lg transition-colors"
                 >
                     <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M6 18L18 6M6 6l12 12" />
                     </svg>
                 </button>
             </div>
 
             {/* Messages */}
-            <div className="flex-1 overflow-y-auto p-4 space-y-3">
-                {messages.length === 0 ? (
-                    <div className="flex items-center justify-center h-full text-stone-400 text-sm">
-                        메시지가 없습니다
+            <div className="flex-1 overflow-y-auto p-5 space-y-4">
+                {isLoading ? (
+                    <div className="flex items-center justify-center h-full">
+                        <div className="w-6 h-6 border-2 border-black/10 border-t-black rounded-full animate-spin" />
+                    </div>
+                ) : messages.length === 0 ? (
+                    <div className="flex flex-col items-center justify-center h-full text-center">
+                        <div className="w-12 h-12 rounded-xl bg-black/5 flex items-center justify-center mb-3">
+                            <svg className="w-6 h-6 text-black/20" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M8 12h.01M12 12h.01M16 12h.01M21 12c0 4.418-4.03 8-9 8a9.863 9.863 0 01-4.255-.949L3 20l1.395-3.72C3.512 15.042 3 13.574 3 12c0-4.418 4.03-8 9-8s9 3.582 9 8z" />
+                            </svg>
+                        </div>
+                        <p className="text-black/30 text-sm">메시지가 없습니다</p>
                     </div>
                 ) : (
                     messages.map((msg) => (
@@ -176,17 +172,18 @@ export default function ChatPanel({ roomId, onClose, onNewMessage }: ChatPanelPr
                             className={`flex flex-col ${msg.isOwn ? 'items-end' : 'items-start'}`}
                         >
                             {!msg.isOwn && (
-                                <span className="text-xs text-stone-500 mb-1">{msg.sender}</span>
+                                <span className="text-xs text-black/40 mb-1 ml-1">{msg.sender}</span>
                             )}
                             <div
-                                className={`max-w-[80%] px-3 py-2 rounded-2xl shadow-sm ${msg.isOwn
-                                    ? 'bg-black text-white rounded-br-md'
-                                    : 'bg-white border border-stone-200 text-stone-900 rounded-bl-md'
-                                    }`}
+                                className={`max-w-[85%] px-4 py-2.5 ${
+                                    msg.isOwn
+                                        ? 'bg-black text-white rounded-2xl rounded-br-md'
+                                        : 'bg-black/5 text-black rounded-2xl rounded-bl-md'
+                                }`}
                             >
-                                <p className="text-sm break-words">{msg.content}</p>
+                                <p className="text-sm leading-relaxed break-words">{msg.content}</p>
                             </div>
-                            <span className="text-xs text-stone-400 mt-1">
+                            <span className="text-[10px] text-black/30 mt-1 mx-1">
                                 {formatTime(msg.timestamp)}
                             </span>
                         </div>
@@ -196,7 +193,7 @@ export default function ChatPanel({ roomId, onClose, onNewMessage }: ChatPanelPr
             </div>
 
             {/* Input */}
-            <div className="flex-shrink-0 p-3 border-t border-black/5 bg-white/50">
+            <div className="flex-shrink-0 p-4 border-t border-black/5">
                 <div className="flex gap-2">
                     <input
                         ref={inputRef}
@@ -205,15 +202,15 @@ export default function ChatPanel({ roomId, onClose, onNewMessage }: ChatPanelPr
                         onChange={(e) => setInput(e.target.value)}
                         onKeyDown={handleKeyDown}
                         placeholder="메시지 입력..."
-                        className="flex-1 px-4 py-2 bg-stone-50 border border-stone-200 rounded-xl text-stone-900 placeholder-stone-400 focus:outline-none focus:ring-2 focus:ring-black/5 focus:border-black/20 text-sm transition-all"
+                        className="flex-1 px-4 py-3 bg-black/5 border-0 rounded-xl text-black placeholder-black/30 focus:outline-none focus:ring-2 focus:ring-black/10 text-sm"
                     />
                     <button
                         onClick={sendMessage}
                         disabled={!input.trim()}
-                        className="px-4 py-2 bg-black hover:bg-stone-800 disabled:bg-stone-200 disabled:text-stone-400 disabled:cursor-not-allowed text-white rounded-xl transition-colors shadow-sm"
+                        className="p-3 bg-black hover:bg-black/80 disabled:bg-black/10 disabled:text-black/20 text-white rounded-xl transition-colors"
                     >
                         <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 19l9 2-9-18-9 18 9-2zm0 0v-8" />
+                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M12 19l9 2-9-18-9 18 9-2zm0 0v-8" />
                         </svg>
                     </button>
                 </div>

@@ -272,30 +272,28 @@ input {
   animation: zoom-in 0.15s ease-out;
 }
 
-/* LiveKit Control Bar Overrides */
+/* LiveKit Control Bar Overrides - Black & White Minimal */
 .lk-control-bar {
   background-color: transparent !important;
   border: none !important;
   padding: 0 !important;
-  gap: 1rem !important;
+  gap: 0.5rem !important;
   display: flex !important;
   align-items: center !important;
   justify-content: center !important;
   margin-top: 1rem !important;
 }
 
-/* Base style for ALL buttons - CIRCULAR & POP */
+/* Base style for ALL buttons - Rounded Rectangle */
 .lk-control-bar .lk-button,
 .lk-control-bar .lk-disconnect-button,
 .lk-control-bar .lk-button-menu {
-  background-color: white !important;
-  color: #1c1917 !important;
-  /* Stone-900 */
-  border: 1px solid rgba(0, 0, 0, 0.1) !important;
-  border-radius: 50% !important;
-  height: 3.5rem !important;
-  /* 56px */
-  width: 3.5rem !important;
+  background-color: rgba(0, 0, 0, 0.05) !important;
+  color: black !important;
+  border: none !important;
+  border-radius: 12px !important;
+  height: 48px !important;
+  width: 48px !important;
 
   /* Flex Centering */
   display: flex !important;
@@ -308,13 +306,12 @@ input {
   margin: 0 !important;
   overflow: visible !important;
 
-  transition: all 0.2s cubic-bezier(0.175, 0.885, 0.32, 1.275) !important;
-  box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.05), 0 2px 4px -1px rgba(0, 0, 0, 0.03) !important;
+  transition: all 0.15s ease !important;
+  box-shadow: none !important;
   cursor: pointer !important;
 }
 
-/* BETTER SYNC: Use a proper centered flex container instead of display: contents 
-   to ensure visibility and opacity are correctly propagated to children */
+/* Button Inner */
 .lk-control-bar .lk-button>.lk-button-inner,
 .lk-control-bar .lk-disconnect-button>.lk-button-inner,
 .lk-control-bar .lk-button-menu>.lk-button-inner {
@@ -326,7 +323,7 @@ input {
   pointer-events: none !important;
 }
 
-/* THE ICON: Force it to be a visible block centered in the flex container */
+/* Icons */
 .lk-control-bar .lk-button svg,
 .lk-control-bar .lk-button img,
 .lk-control-bar .lk-button [class*="icon"],
@@ -336,20 +333,18 @@ input {
 .lk-control-bar .lk-disconnect-button img,
 .lk-control-bar .lk-button-menu [class*="icon"] {
   display: block !important;
-  width: 1.5rem !important;
-  height: 1.5rem !important;
+  width: 1.25rem !important;
+  height: 1.25rem !important;
   margin: auto !important;
   color: inherit !important;
   fill: currentColor !important;
   pointer-events: none !important;
   flex-shrink: 0 !important;
-
-  /* Apply requested fine-tuning: x +4, y -2 (5px up from previous) */
   position: static !important;
   transform: translate(4px, 4px) !important;
 }
 
-/* EXCEPTION: Menu Items (Maintain rectangular layout) */
+/* Menu Items */
 .lk-device-menu .lk-button,
 .lk-menu .lk-button {
   width: 100% !important;
@@ -357,8 +352,6 @@ input {
   min-height: 44px !important;
   border-radius: 8px !important;
   aspect-ratio: auto !important;
-
-  /* Restore normal flex flow */
   display: flex !important;
   align-items: center !important;
   justify-content: flex-start !important;
@@ -366,7 +359,6 @@ input {
   position: relative !important;
 }
 
-/* Restore Menu Item children flow */
 .lk-device-menu .lk-button *,
 .lk-menu .lk-button * {
   width: auto !important;
@@ -376,7 +368,6 @@ input {
   pointer-events: auto !important;
 }
 
-/* Menu Icons */
 .lk-device-menu svg,
 .lk-menu svg {
   width: 1.25rem !important;
@@ -385,22 +376,15 @@ input {
   display: block !important;
 }
 
-/* Hover Effects (Pop Animation) */
+/* Hover Effects */
 .lk-control-bar .lk-button:hover,
-.lk-control-bar .lk-disconnect-button:hover,
 .lk-control-bar .lk-button-menu:hover {
-  background-color: #fafaf9 !important;
-  /* Stone-50 */
-  border-color: rgba(0, 0, 0, 0.2) !important;
-  transform: scale(1.15) !important;
-  box-shadow: 0 20px 25px -5px rgba(0, 0, 0, 0.1), 0 10px 10px -5px rgba(0, 0, 0, 0.04) !important;
-  z-index: 50;
+  background-color: rgba(0, 0, 0, 0.1) !important;
 }
 
-/* Disconnect Button (Red) */
+/* Disconnect Button Hover - Black instead of Red */
 .lk-control-bar .lk-disconnect-button:hover {
-  background-color: #dc2626 !important;
-  border-color: #dc2626 !important;
+  background-color: black !important;
   color: white !important;
 }
 
@@ -408,36 +392,37 @@ input {
   color: white !important;
 }
 
-/* Active/Muted States */
-.lk-control-bar .lk-button[aria-pressed="true"] {
-  background-color: #1c1917 !important;
+/* Active/Enabled States - Black */
+.lk-control-bar .lk-button[aria-pressed="true"],
+.lk-control-bar .lk-button[data-lk-enabled="true"] {
+  background-color: black !important;
   color: white !important;
-  border-color: #1c1917 !important;
 }
 
-.lk-control-bar .lk-button[data-muted="true"] {
-  background-color: #fee2e2 !important;
-  color: #ef4444 !important;
-  border-color: #fecaca !important;
+/* Muted States - Black (not red) */
+.lk-control-bar .lk-button[data-muted="true"],
+.lk-control-bar .lk-button[data-lk-muted="true"] {
+  background-color: black !important;
+  color: white !important;
 }
 
-.lk-control-bar .lk-button[data-muted="true"] svg {
-  color: #ef4444 !important;
+.lk-control-bar .lk-button[data-muted="true"] svg,
+.lk-control-bar .lk-button[data-lk-muted="true"] svg {
+  color: white !important;
 }
 
-/* Menu Dropdown Position: ALWAYS ABOVE */
+/* Menu Dropdown */
 .lk-device-menu,
 .lk-menu {
   background-color: white !important;
-  border: 1px solid rgba(0, 0, 0, 0.1) !important;
+  border: 1px solid rgba(0, 0, 0, 0.08) !important;
   border-radius: 12px !important;
   padding: 8px !important;
-  box-shadow: 0 20px 25px -5px rgba(0, 0, 0, 0.1), 0 8px 10px -6px rgba(0, 0, 0, 0.1) !important;
+  box-shadow: 0 8px 30px -12px rgba(0, 0, 0, 0.15) !important;
 
   position: absolute !important;
   top: auto !important;
-  bottom: 85px !important;
-  /* Slightly more gap */
+  bottom: 70px !important;
   left: 0 !important;
   margin: 0 !important;
 
@@ -446,20 +431,18 @@ input {
   max-width: 350px !important;
   z-index: 100 !important;
 
-  /* Smooth Entry Animation */
-  animation: dropdown-pop 0.25s cubic-bezier(0.175, 0.885, 0.32, 1.275) forwards !important;
+  animation: dropdown-fade 0.15s ease forwards !important;
   transform-origin: bottom left !important;
 }
 
-@keyframes dropdown-pop {
+@keyframes dropdown-fade {
   0% {
     opacity: 0;
-    transform: scale(0.95) translateY(10px);
+    transform: translateY(4px);
   }
-
   100% {
     opacity: 1;
-    transform: scale(1) translateY(0);
+    transform: translateY(0);
   }
 }
 
@@ -482,4 +465,151 @@ input {
   display: flex !important;
   align-items: center !important;
   gap: 0.5rem !important;
+}
+
+/* ===================================
+   LiveKit Participant Tile Styles
+   Black & White Minimal Design
+   =================================== */
+
+/* Grid Layout */
+.lk-grid-layout {
+  gap: 16px !important;
+  padding: 16px !important;
+  background: white !important;
+}
+
+/* Participant Tile Container */
+.lk-participant-tile {
+  border-radius: 16px !important;
+  overflow: hidden !important;
+  background: rgba(0, 0, 0, 0.03) !important;
+  border: 1px solid rgba(0, 0, 0, 0.08) !important;
+  box-shadow: none !important;
+  transition: all 0.2s ease !important;
+  position: relative !important;
+}
+
+.lk-participant-tile:hover {
+  border-color: rgba(0, 0, 0, 0.15) !important;
+  box-shadow: 0 8px 30px -12px rgba(0, 0, 0, 0.15) !important;
+}
+
+/* Video Element */
+.lk-participant-tile video {
+  border-radius: 16px !important;
+  object-fit: cover !important;
+}
+
+/* Participant Metadata (name bar at bottom) */
+.lk-participant-metadata {
+  position: absolute !important;
+  bottom: 0 !important;
+  left: 0 !important;
+  right: 0 !important;
+  padding: 12px 14px !important;
+  background: linear-gradient(to top, rgba(0, 0, 0, 0.7) 0%, rgba(0, 0, 0, 0.3) 60%, transparent 100%) !important;
+  display: flex !important;
+  align-items: center !important;
+  gap: 8px !important;
+}
+
+/* Participant Name */
+.lk-participant-name {
+  font-size: 13px !important;
+  font-weight: 500 !important;
+  color: white !important;
+  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.3) !important;
+  overflow: hidden !important;
+  text-overflow: ellipsis !important;
+  white-space: nowrap !important;
+}
+
+/* Mute Indicator */
+.lk-participant-tile .lk-participant-metadata-item {
+  display: flex !important;
+  align-items: center !important;
+  gap: 4px !important;
+}
+
+/* Audio Mute Icon - Black instead of red */
+.lk-participant-tile .lk-participant-metadata-item svg {
+  width: 14px !important;
+  height: 14px !important;
+  color: white !important;
+  opacity: 0.8 !important;
+}
+
+/* Connection Quality Indicator */
+.lk-connection-quality {
+  position: absolute !important;
+  top: 10px !important;
+  right: 10px !important;
+  display: flex !important;
+  gap: 2px !important;
+  padding: 4px 6px !important;
+  background: rgba(255, 255, 255, 0.9) !important;
+  backdrop-filter: blur(4px) !important;
+  border-radius: 6px !important;
+  border: 1px solid rgba(0, 0, 0, 0.05) !important;
+}
+
+.lk-connection-quality svg {
+  width: 12px !important;
+  height: 12px !important;
+  color: black !important;
+}
+
+/* Focus Ring (for speaking indicator) - Black ring */
+.lk-participant-tile.lk-focus-toggle-button[data-lk-speaking="true"] {
+  border-color: black !important;
+  box-shadow: 0 0 0 2px black !important;
+}
+
+/* Placeholder when video is off */
+.lk-participant-placeholder {
+  display: flex !important;
+  align-items: center !important;
+  justify-content: center !important;
+  background: rgba(0, 0, 0, 0.03) !important;
+  width: 100% !important;
+  height: 100% !important;
+}
+
+.lk-participant-placeholder svg {
+  width: 64px !important;
+  height: 64px !important;
+  color: rgba(0, 0, 0, 0.15) !important;
+}
+
+/* Screen Share Tile - Black border */
+.lk-participant-tile[data-lk-source="screen_share"] {
+  border: 2px solid rgba(0, 0, 0, 0.2) !important;
+}
+
+.lk-participant-tile[data-lk-source="screen_share"]:hover {
+  border-color: rgba(0, 0, 0, 0.4) !important;
+}
+
+/* Focus Layout (when someone is pinned/focused) */
+.lk-focus-layout {
+  gap: 16px !important;
+  background: white !important;
+}
+
+.lk-focus-layout .lk-focused-participant {
+  border-radius: 20px !important;
+  overflow: hidden !important;
+}
+
+/* Carousel (side participants in focus mode) */
+.lk-carousel {
+  gap: 8px !important;
+  padding: 8px !important;
+  background: white !important;
+}
+
+.lk-carousel .lk-participant-tile {
+  border-radius: 12px !important;
+  min-width: 140px !important;
 }
