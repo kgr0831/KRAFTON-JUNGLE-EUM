@@ -2,21 +2,31 @@
 
 import { useState, useEffect, useCallback, useRef } from 'react';
 import { Room } from 'livekit-client';
-import { RemoteCursor, CursorEvent } from '../types';
+import { RemoteCursor, CursorEvent, WhiteboardTool } from '../types';
 import { CURSOR_SETTINGS } from '../constants';
 import { getCursorColor } from '../utils';
+
+interface ToolState {
+    tool: WhiteboardTool;
+    penColor: string;
+    isDrawing: boolean;
+}
 
 interface UseWhiteboardCursorsOptions {
     room: Room | undefined;
     participantIdentities: string[];
+    toolState: ToolState;
 }
 
-interface LocalCursor {
+export interface LocalCursor {
     x: number;
     y: number;
     participantId: string;
     participantName: string;
     color: string;
+    tool: WhiteboardTool;
+    penColor?: string;
+    isDrawing?: boolean;
 }
 
 interface UseWhiteboardCursorsReturn {
@@ -30,11 +40,18 @@ interface UseWhiteboardCursorsReturn {
 export function useWhiteboardCursors({
     room,
     participantIdentities,
+    toolState,
 }: UseWhiteboardCursorsOptions): UseWhiteboardCursorsReturn {
     const [remoteCursors, setRemoteCursors] = useState<Map<string, RemoteCursor>>(new Map());
     const [localCursor, setLocalCursor] = useState<LocalCursor | null>(null);
     const lastBroadcastRef = useRef<number>(0);
     const cursorColorRef = useRef<string>('');
+    const toolStateRef = useRef<ToolState>(toolState);
+
+    // Keep toolStateRef in sync
+    useEffect(() => {
+        toolStateRef.current = toolState;
+    }, [toolState]);
 
     // Set cursor color on mount
     useEffect(() => {
@@ -50,6 +67,7 @@ export function useWhiteboardCursors({
         const participantId = room.localParticipant.identity;
         const participantName = room.localParticipant.name || room.localParticipant.identity;
         const color = cursorColorRef.current;
+        const { tool, penColor, isDrawing } = toolStateRef.current;
 
         // Update local cursor immediately (no throttle for local display)
         setLocalCursor({
@@ -58,6 +76,9 @@ export function useWhiteboardCursors({
             participantId,
             participantName,
             color,
+            tool,
+            penColor: tool === 'pen' ? penColor : undefined,
+            isDrawing,
         });
 
         // Throttle broadcasting to other participants
@@ -72,6 +93,9 @@ export function useWhiteboardCursors({
             participantId,
             participantName,
             color,
+            tool,
+            penColor: tool === 'pen' ? penColor : undefined,
+            isDrawing,
         };
 
         const encoder = new TextEncoder();
@@ -95,6 +119,9 @@ export function useWhiteboardCursors({
                 participantName: event.participantName,
                 color: event.color,
                 lastUpdate: Date.now(),
+                tool: event.tool || 'pen',
+                penColor: event.penColor,
+                isDrawing: event.isDrawing,
             });
             return newMap;
         });

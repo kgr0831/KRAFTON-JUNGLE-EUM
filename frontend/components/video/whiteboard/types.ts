@@ -24,6 +24,10 @@ export interface CursorEvent {
     participantId: string;
     participantName: string;
     color: string;
+    // Tool state
+    tool: WhiteboardTool;
+    penColor?: string;  // Only when tool is 'pen'
+    isDrawing?: boolean;  // Currently drawing/erasing
 }
 
 export type WhiteboardEvent = DrawEvent | ClearEvent | RefetchEvent | CursorEvent;
@@ -36,6 +40,10 @@ export interface RemoteCursor {
     participantName: string;
     color: string;
     lastUpdate: number;
+    // Tool state
+    tool: WhiteboardTool;
+    penColor?: string;
+    isDrawing?: boolean;
 }
 
 // Tool Types

@@ -6,15 +6,23 @@ import Image from 'next/image';
 interface Speaker {
     name: string;
     profileImg?: string;
+    isLocal?: boolean;  // 본인 여부
 }
 
 interface SubtitleOverlayProps {
-    text: string | null;
+    text: string | null;          // 표시할 메인 텍스트 (original or translated)
+    originalText?: string | null; // STT 원본 텍스트
     speaker?: Speaker;
-    isActive?: boolean; // 유지 (호환성)
+    isActive?: boolean;
+    showTranslation?: boolean;    // 번역 표시 여부
 }
 
-export default function SubtitleOverlay({ text, speaker }: SubtitleOverlayProps) {
+export default function SubtitleOverlay({
+    text,
+    originalText,
+    speaker,
+    showTranslation = false,
+}: SubtitleOverlayProps) {
     const [displayText, setDisplayText] = useState<string>('');
     const [isVisible, setIsVisible] = useState(false);
     const [isTyping, setIsTyping] = useState(false);
@@ -133,17 +141,38 @@ export default function SubtitleOverlay({ text, speaker }: SubtitleOverlayProps)
 
                 {/* 이름 + 텍스트 */}
                 <div className="flex flex-col min-w-0 max-w-lg">
+                    {/* 이름 + (나) 표시 */}
                     {speaker?.name && (
-                        <span className="text-white/60 text-xs font-medium truncate">
+                        <span className="text-white/60 text-xs font-medium truncate flex items-center gap-1">
                             {speaker.name}
+                            {speaker.isLocal && (
+                                <span className="text-white/40">(나)</span>
+                            )}
                         </span>
                     )}
-                    <p className="text-white text-base font-medium leading-snug">
-                        {displayText}
-                        {isTyping && (
-                            <span className="inline-block w-0.5 h-4 bg-white/70 ml-0.5 animate-blink align-middle" />
-                        )}
-                    </p>
+
+                    {/* 번역 모드: 원본 텍스트 (작게) + 번역 텍스트 (크게) */}
+                    {showTranslation && originalText && originalText !== text ? (
+                        <>
+                            <p className="text-white/50 text-sm leading-snug mb-0.5">
+                                {originalText}
+                            </p>
+                            <p className="text-white text-base font-medium leading-snug">
+                                {displayText}
+                                {isTyping && (
+                                    <span className="inline-block w-0.5 h-4 bg-white/70 ml-0.5 animate-blink align-middle" />
+                                )}
+                            </p>
+                        </>
+                    ) : (
+                        /* STT만 표시 */
+                        <p className="text-white text-base font-medium leading-snug">
+                            {displayText}
+                            {isTyping && (
+                                <span className="inline-block w-0.5 h-4 bg-white/70 ml-0.5 animate-blink align-middle" />
+                            )}
+                        </p>
+                    )}
                 </div>
             </div>
 

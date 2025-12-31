@@ -42,80 +42,69 @@ function VideoCallContent({
     const [targetLanguage, setTargetLanguage] = useState<TargetLanguage>('en');
     const [unreadCount, setUnreadCount] = useState(0);
     const [voiceRecords, setVoiceRecords] = useState<VoiceRecord[]>([]);
-    const [currentSpeaker, setCurrentSpeaker] = useState<{ name: string; profileImg?: string } | null>(null);
+    const [currentSpeaker, setCurrentSpeaker] = useState<{ name: string; profileImg?: string; isLocal?: boolean } | null>(null);
     const [currentTranscript, setCurrentTranscript] = useState<string | null>(null);
+    const [currentOriginal, setCurrentOriginal] = useState<string | null>(null);
     const lastTranscriptRef = useRef<string | null>(null);
     const transcriptTimeoutRef = useRef<NodeJS.Timeout | null>(null);
 
-    // 번역 결과를 음성 기록에 추가 (원격 참가자의 음성)
+    // STT/번역 결과 처리 (모든 원격 참가자)
     const handleTranscript = useCallback((data: RemoteTranscriptData) => {
-        console.log("[VideoCallFeature] ========================================");
-        console.log("[VideoCallFeature] handleTranscript called!");
-        console.log("[VideoCallFeature] data:", JSON.stringify(data, null, 2));
-        console.log("[VideoCallFeature] lastTranscriptRef.current:", lastTranscriptRef.current);
+        console.log("[VideoCallFeature] Transcript:", data.participantName, "-", data.original);
 
         // 중복 방지
-        if (data.translated === lastTranscriptRef.current) {
-            console.log("[VideoCallFeature] Duplicate transcript, skipping");
+        const key = `${data.participantId}-${data.original}`;
+        if (key === lastTranscriptRef.current) {
             return;
         }
-        lastTranscriptRef.current = data.translated;
+        lastTranscriptRef.current = key;
 
-        // 현재 발화자 및 자막 설정
-        setCurrentSpeaker({
-            name: data.participantName || data.participantId,
-            profileImg: undefined,
-        });
-        setCurrentTranscript(data.translated);
-
-        // 5초 후 자막 클리어
-        if (transcriptTimeoutRef.current) {
-            clearTimeout(transcriptTimeoutRef.current);
-        }
-        transcriptTimeoutRef.current = setTimeout(() => {
-            setCurrentTranscript(null);
-            setCurrentSpeaker(null);
-        }, 5000);
-
+        // 음성 기록에 항상 추가 (STT)
+        // 번역 모드일 때만 translated와 targetLanguage 포함
         const newRecord: VoiceRecord = {
             id: `${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
             speaker: data.participantName || data.participantId,
             profileImg: undefined,
             original: data.original,
-            translated: data.translated,
+            translated: isTranslationOpen ? data.translated : undefined,
+            targetLanguage: isTranslationOpen ? targetLanguage : undefined,
             timestamp: Date.now(),
         };
-        console.log("[VideoCallFeature] Adding voice record:", newRecord);
-        setVoiceRecords(prev => {
-            console.log("[VideoCallFeature] Previous records count:", prev.length);
-            const newRecords = [...prev, newRecord];
-            console.log("[VideoCallFeature] New records count:", newRecords.length);
-            return newRecords;
-        });
-        console.log("[VideoCallFeature] ========================================");
-    }, []);
+        setVoiceRecords(prev => [...prev, newRecord]);
 
-    // 원격 참가자 음성 번역 훅 (다른 사람들의 음성을 번역)
+        // 번역 모드일 때만 자막 표시
+        if (isTranslationOpen) {
+            setCurrentSpeaker({
+                name: data.participantName || data.participantId,
+                profileImg: undefined,
+                isLocal: false,
+            });
+            setCurrentOriginal(data.original);
+            setCurrentTranscript(data.translated);
+
+            // 5초 후 자막 클리어
+            if (transcriptTimeoutRef.current) {
+                clearTimeout(transcriptTimeoutRef.current);
+            }
+            transcriptTimeoutRef.current = setTimeout(() => {
+                setCurrentTranscript(null);
+                setCurrentOriginal(null);
+                setCurrentSpeaker(null);
+            }, 5000);
+        }
+    }, [isTranslationOpen, targetLanguage]);
+
+    // 원격 참가자 음성 캡처 훅 (STT는 항상 활성화, TTS는 번역 모드일 때만)
     const {
         isActive: isTranslationActive,
-        activeParticipantCount,
     } = useRemoteParticipantTranslation({
-        enabled: isTranslationOpen,
+        enabled: isTranslationOpen,  // TTS 재생 여부 (번역 모드)
+        sttEnabled: true,            // STT는 항상 활성화
         targetLanguage,
         autoPlayTTS: true,
         chunkIntervalMs: 1500,
         onTranscript: handleTranscript,
     });
-
-    // currentTranscript 변경 감지
-    useEffect(() => {
-        console.log("[VideoCallFeature] currentTranscript changed:", currentTranscript);
-    }, [currentTranscript]);
-
-    // voiceRecords 변경 감지
-    useEffect(() => {
-        console.log("[VideoCallFeature] voiceRecords updated:", voiceRecords.length, "records");
-    }, [voiceRecords]);
 
     const toggleChat = useCallback(() => {
         setIsChatOpen(prev => {
@@ -208,8 +197,10 @@ function VideoCallContent({
             {/* 실시간 자막 오버레이 */}
             <SubtitleOverlay
                 text={currentTranscript}
+                originalText={currentOriginal}
                 speaker={currentSpeaker || undefined}
                 isActive={isTranslationActive}
+                showTranslation={isTranslationOpen}
             />
         </>
     );

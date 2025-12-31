@@ -1,16 +1,9 @@
 'use client';
 
 import { memo } from 'react';
-import { RemoteCursor } from '../types';
+import { RemoteCursor, WhiteboardTool } from '../types';
 import { worldToScreen } from '../utils';
-
-interface LocalCursor {
-    x: number;
-    y: number;
-    participantId: string;
-    participantName: string;
-    color: string;
-}
+import { LocalCursor } from '../hooks/useWhiteboardCursors';
 
 interface CursorsProps {
     cursors: Map<string, RemoteCursor>;
@@ -27,9 +20,55 @@ interface CursorItemProps {
     isLocal?: boolean;
     scale: number;
     panOffset: { x: number; y: number };
+    tool: WhiteboardTool;
+    penColor?: string;
+    isDrawing?: boolean;
 }
 
-function CursorItem({ x, y, color, name, isLocal, scale, panOffset }: CursorItemProps) {
+// Tool icon components
+function PenIcon({ color }: { color: string }) {
+    return (
+        <svg width="12" height="12" viewBox="0 0 24 24" fill="none">
+            <path
+                d="M15.232 5.232l3.536 3.536m-2.036-5.036a2.5 2.5 0 113.536 3.536L6.5 21.036H3v-3.572L16.732 3.732z"
+                stroke={color}
+                strokeWidth="2.5"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+            />
+        </svg>
+    );
+}
+
+function EraserIcon() {
+    return (
+        <svg width="12" height="12" viewBox="0 0 24 24" fill="none">
+            <path
+                d="M19 20H5M18 9l-6-6-9 9a2 2 0 000 2.828l3.172 3.172a2 2 0 002.828 0L18 9z"
+                stroke="white"
+                strokeWidth="2"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+            />
+        </svg>
+    );
+}
+
+function HandIcon() {
+    return (
+        <svg width="12" height="12" viewBox="0 0 24 24" fill="none">
+            <path
+                d="M7 11.5V14m0-2.5v-6a1.5 1.5 0 113 0m-3 6a1.5 1.5 0 00-3 0v2a7.5 7.5 0 0015 0v-5a1.5 1.5 0 00-3 0m-6-3V11m0-5.5v-1a1.5 1.5 0 013 0v1m0 0V11m0-5.5a1.5 1.5 0 013 0v3m0 0V11"
+                stroke="white"
+                strokeWidth="2"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+            />
+        </svg>
+    );
+}
+
+function CursorItem({ x, y, color, name, isLocal, scale, panOffset, tool, penColor, isDrawing }: CursorItemProps) {
     const { x: screenX, y: screenY } = worldToScreen(x, y, panOffset, scale);
 
     return (
@@ -57,16 +96,38 @@ function CursorItem({ x, y, color, name, isLocal, scale, panOffset }: CursorItem
                 />
             </svg>
 
-            {/* Name Badge */}
+            {/* Name Badge with Tool Indicator */}
             <div
                 className="absolute left-5 top-4 flex items-center gap-1.5 px-2 py-1 rounded-full text-white text-xs font-medium whitespace-nowrap shadow-lg"
                 style={{ backgroundColor: color }}
             >
-                <span className="max-w-[100px] truncate">
+                {/* Tool Icon */}
+                <span className="flex items-center justify-center">
+                    {tool === 'pen' && <PenIcon color={penColor || 'white'} />}
+                    {tool === 'eraser' && <EraserIcon />}
+                    {tool === 'hand' && <HandIcon />}
+                </span>
+
+                {/* Pen color indicator */}
+                {tool === 'pen' && penColor && (
+                    <span
+                        className="w-2.5 h-2.5 rounded-full border border-white/50"
+                        style={{ backgroundColor: penColor }}
+                    />
+                )}
+
+                {/* Name */}
+                <span className="max-w-[80px] truncate">
                     {name}
                 </span>
+
                 {isLocal && (
                     <span className="opacity-70">(나)</span>
+                )}
+
+                {/* Drawing indicator */}
+                {isDrawing && (
+                    <span className="w-1.5 h-1.5 rounded-full bg-white animate-pulse" />
                 )}
             </div>
         </div>
@@ -86,6 +147,9 @@ function CursorsComponent({ cursors, localCursor, scale, panOffset }: CursorsPro
                     name={cursor.participantName}
                     scale={scale}
                     panOffset={panOffset}
+                    tool={cursor.tool}
+                    penColor={cursor.penColor}
+                    isDrawing={cursor.isDrawing}
                 />
             ))}
 
@@ -99,6 +163,9 @@ function CursorsComponent({ cursors, localCursor, scale, panOffset }: CursorsPro
                     isLocal
                     scale={scale}
                     panOffset={panOffset}
+                    tool={localCursor.tool}
+                    penColor={localCursor.penColor}
+                    isDrawing={localCursor.isDrawing}
                 />
             )}
         </>

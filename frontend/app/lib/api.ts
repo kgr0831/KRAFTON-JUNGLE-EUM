@@ -229,6 +229,38 @@ interface WhiteboardResponse {
   canRedo: boolean;
 }
 
+// 음성 기록 관련 타입
+interface VoiceRecord {
+  id: number;
+  meeting_id: number;
+  speaker_id?: number;
+  speaker_name: string;
+  original: string;
+  translated?: string;
+  target_lang?: string;
+  created_at: string;
+  speaker?: UserSearchResult;
+}
+
+interface VoiceRecordsResponse {
+  meeting_id: number;
+  records: VoiceRecord[];
+  total: number;
+  limit: number;
+  offset: number;
+}
+
+interface CreateVoiceRecordRequest {
+  speaker_name: string;
+  original: string;
+  translated?: string;
+  target_lang?: string;
+}
+
+interface CreateVoiceRecordBulkRequest {
+  records: CreateVoiceRecordRequest[];
+}
+
 // HTTP-only 쿠키 기반 인증 (XSS 방지)
 class ApiClient {
   private isLoggedIn: boolean = false;
@@ -703,6 +735,33 @@ class ApiClient {
       body: JSON.stringify({ room: roomName, ...action }),
     });
   }
+
+  // ========== 음성 기록 API ==========
+  async getVoiceRecords(workspaceId: number, meetingId: number, limit = 100, offset = 0): Promise<VoiceRecordsResponse> {
+    return this.request<VoiceRecordsResponse>(
+      `/api/workspaces/${workspaceId}/meetings/${meetingId}/voice-records?limit=${limit}&offset=${offset}`
+    );
+  }
+
+  async createVoiceRecord(workspaceId: number, meetingId: number, data: CreateVoiceRecordRequest): Promise<VoiceRecord> {
+    return this.request<VoiceRecord>(`/api/workspaces/${workspaceId}/meetings/${meetingId}/voice-records`, {
+      method: 'POST',
+      body: JSON.stringify(data),
+    });
+  }
+
+  async createVoiceRecordBulk(workspaceId: number, meetingId: number, records: CreateVoiceRecordRequest[]): Promise<{ message: string; count: number }> {
+    return this.request(`/api/workspaces/${workspaceId}/meetings/${meetingId}/voice-records/bulk`, {
+      method: 'POST',
+      body: JSON.stringify({ records }),
+    });
+  }
+
+  async deleteVoiceRecords(workspaceId: number, meetingId: number): Promise<{ message: string; count: number }> {
+    return this.request(`/api/workspaces/${workspaceId}/meetings/${meetingId}/voice-records`, {
+      method: 'DELETE',
+    });
+  }
 }
 
 export const apiClient = new ApiClient();
@@ -739,4 +798,8 @@ export type {
   NotificationsResponse,
   // Role
   Role,
+  // Voice Record
+  VoiceRecord,
+  VoiceRecordsResponse,
+  CreateVoiceRecordRequest,
 };

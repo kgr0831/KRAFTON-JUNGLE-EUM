@@ -1,8 +1,8 @@
 "use client";
 
-import { useState, useCallback, useEffect, useRef } from "react";
+import { useState, useEffect, useRef, useMemo } from "react";
 import { useParticipants, useLocalParticipant } from "@livekit/components-react";
-import { Track, RemoteParticipant } from "livekit-client";
+import { Track, RemoteParticipant, LocalParticipant } from "livekit-client";
 import { TranscriptData, TargetLanguage } from "./useAudioWebSocket";
 import { useAudioPlayback } from "./useAudioPlayback";
 import { useAudioDucking } from "./useAudioDucking";
@@ -17,7 +17,8 @@ export interface RemoteTranscriptData extends TranscriptData {
 }
 
 interface UseRemoteParticipantTranslationOptions {
-    enabled: boolean;
+    enabled: boolean;              // TTS 재생 여부 (번역 모드)
+    sttEnabled?: boolean;          // STT 항상 활성화 여부 (기본: true)
     targetLanguage?: TargetLanguage;
     autoPlayTTS?: boolean;
     chunkIntervalMs?: number;
@@ -87,6 +88,7 @@ function resample(inputBuffer: Float32Array, inputSampleRate: number, outputSamp
 
 export function useRemoteParticipantTranslation({
     enabled,
+    sttEnabled = true,  // STT는 기본적으로 항상 활성화
     targetLanguage = 'en',
     autoPlayTTS = true,
     chunkIntervalMs = CHUNK_INTERVAL_MS,
@@ -101,50 +103,180 @@ export function useRemoteParticipantTranslation({
     const participants = useParticipants();
     const { localParticipant } = useLocalParticipant();
 
+    // All refs for stable references
     const streamsRef = useRef<Map<string, ParticipantStream>>(new Map());
     const enabledRef = useRef(enabled);
+    const sttEnabledRef = useRef(sttEnabled);
     const targetLanguageRef = useRef(targetLanguage);
+    const autoPlayTTSRef = useRef(autoPlayTTS);
+    const chunkIntervalMsRef = useRef(chunkIntervalMs);
     const onTranscriptRef = useRef(onTranscript);
     const onErrorRef = useRef(onError);
+    const localParticipantIdRef = useRef<string | null>(null);
+    const isInitializedRef = useRef(false);
 
     // Audio ducking
     const { duckParticipant, unduckParticipant, unduckAll } = useAudioDucking();
+    const duckParticipantRef = useRef(duckParticipant);
+    const unduckParticipantRef = useRef(unduckParticipant);
+    const unduckAllRef = useRef(unduckAll);
 
     // TTS playback with ducking callbacks
     const { queueAudio, stopAudio } = useAudioPlayback({
         onPlayStart: (participantId) => {
             if (participantId) {
                 console.log(`[RemoteTranslation] TTS started for ${participantId}, ducking...`);
-                duckParticipant(participantId);
+                duckParticipantRef.current(participantId);
             }
         },
         onPlayEnd: (participantId) => {
             if (participantId) {
                 console.log(`[RemoteTranslation] TTS ended for ${participantId}, unducking...`);
-                unduckParticipant(participantId);
+                unduckParticipantRef.current(participantId);
             }
         },
         onError: (err) => {
             console.error("[RemoteTranslation] Playback error:", err);
         },
     });
+    const queueAudioRef = useRef(queueAudio);
+    const stopAudioRef = useRef(stopAudio);
 
-    // Keep refs updated
+    // Keep all refs updated
     useEffect(() => {
         enabledRef.current = enabled;
+        sttEnabledRef.current = sttEnabled;
         targetLanguageRef.current = targetLanguage;
+        autoPlayTTSRef.current = autoPlayTTS;
+        chunkIntervalMsRef.current = chunkIntervalMs;
         onTranscriptRef.current = onTranscript;
         onErrorRef.current = onError;
-    }, [enabled, targetLanguage, onTranscript, onError]);
+        duckParticipantRef.current = duckParticipant;
+        unduckParticipantRef.current = unduckParticipant;
+        unduckAllRef.current = unduckAll;
+        queueAudioRef.current = queueAudio;
+        stopAudioRef.current = stopAudio;
+    }, [enabled, sttEnabled, targetLanguage, autoPlayTTS, chunkIntervalMs, onTranscript, onError, duckParticipant, unduckParticipant, unduckAll, queueAudio, stopAudio]);
 
-    // Get remote participants (excluding local)
-    const remoteParticipants = participants.filter(
-        p => !p.isLocal && p.identity !== localParticipant?.identity
-    ) as RemoteParticipant[];
+    // Update local participant identity ref
+    useEffect(() => {
+        if (localParticipant) {
+            localParticipantIdRef.current = localParticipant.identity;
+        }
+    }, [localParticipant]);
 
-    // Create stream for a participant
-    const createParticipantStream = useCallback(async (participant: RemoteParticipant) => {
+    // Memoize participant IDs for stable comparison
+    const participantIds = useMemo(
+        () => participants.map(p => p.identity).sort().join(','),
+        [participants]
+    );
+
+    // Helper functions using refs (not useCallback to avoid dependency issues)
+    const cleanupParticipantStream = (participantId: string) => {
+        const stream = streamsRef.current.get(participantId);
+        if (!stream) return;
+
+        console.log(`[RemoteTranslation] Cleaning up stream for ${participantId}`);
+
+        if (stream.chunkInterval) {
+            clearInterval(stream.chunkInterval);
+        }
+
+        if (stream.workletNode) {
+            stream.workletNode.disconnect();
+        }
+
+        if (stream.sourceNode) {
+            stream.sourceNode.disconnect();
+        }
+
+        if (stream.audioContext && stream.audioContext.state !== 'closed') {
+            stream.audioContext.close();
+        }
+
+        if (stream.ws && stream.ws.readyState === WebSocket.OPEN) {
+            stream.ws.close();
+        }
+
+        streamsRef.current.delete(participantId);
+    };
+
+    const cleanupAllStreams = () => {
+        console.log(`[RemoteTranslation] Cleaning up all streams`);
+
+        streamsRef.current.forEach((_, participantId) => {
+            cleanupParticipantStream(participantId);
+        });
+
+        unduckAllRef.current();
+        stopAudioRef.current();
+        setTranscripts(new Map());
+    };
+
+    const startAudioCapture = async (participantId: string, mediaStream: MediaStream) => {
+        const stream = streamsRef.current.get(participantId);
+        if (!stream || !stream.audioContext) return;
+
+        try {
+            // Load AudioWorklet
+            await stream.audioContext.audioWorklet.addModule('/audio-processor.js');
+
+            // Create source node
+            const sourceNode = stream.audioContext.createMediaStreamSource(mediaStream);
+            stream.sourceNode = sourceNode;
+
+            // Create worklet node
+            const workletNode = new AudioWorkletNode(stream.audioContext, 'audio-processor');
+            stream.workletNode = workletNode;
+
+            // Handle audio data
+            workletNode.port.onmessage = (event) => {
+                const { audioData } = event.data;
+                if (audioData) {
+                    stream.audioBuffer.push(new Float32Array(audioData));
+                }
+            };
+
+            // Connect (NOT to destination)
+            sourceNode.connect(workletNode);
+
+            // Start chunk interval
+            stream.chunkInterval = setInterval(() => {
+                if (stream.audioBuffer.length === 0) return;
+                if (!stream.ws || stream.ws.readyState !== WebSocket.OPEN) return;
+                if (!stream.isHandshakeComplete) return;
+
+                const totalLength = stream.audioBuffer.reduce((sum, arr) => sum + arr.length, 0);
+                if (totalLength === 0) return;
+
+                const combined = new Float32Array(totalLength);
+                let offset = 0;
+                for (const chunk of stream.audioBuffer) {
+                    combined.set(chunk, offset);
+                    offset += chunk.length;
+                }
+                stream.audioBuffer = [];
+
+                // Resample to 16kHz
+                const resampled = resample(combined, stream.audioContext.sampleRate, SAMPLE_RATE);
+                const int16Data = float32ToInt16(resampled);
+
+                stream.ws.send(int16Data.buffer);
+                console.log(`[RemoteTranslation] ${participantId}: Sent ${int16Data.length} samples`);
+            }, chunkIntervalMsRef.current);
+
+            console.log(`[RemoteTranslation] ${participantId}: Audio capture started`);
+
+        } catch (err) {
+            console.error(`[RemoteTranslation] ${participantId}: Failed to start audio capture:`, err);
+        }
+    };
+
+    const createParticipantStream = async (participant: RemoteParticipant | LocalParticipant) => {
+        if (!participant) return;
+
         const participantId = participant.identity;
+        const isLocal = participantId === localParticipantIdRef.current;
 
         // Check if already exists
         if (streamsRef.current.has(participantId)) {
@@ -241,10 +373,13 @@ export function useRemoteParticipantTranslation({
                         console.error(`[RemoteTranslation] ${participantId}: Failed to parse message:`, e);
                     }
                 } else if (event.data instanceof ArrayBuffer) {
-                    // TTS audio
+                    // TTS audio - only play when translation mode is enabled AND not for local participant
                     console.log(`[RemoteTranslation] ${participantId}: Received TTS audio:`, event.data.byteLength, "bytes");
-                    if (autoPlayTTS) {
-                        queueAudio(event.data, 24000, participantId);
+                    const currentIsLocal = participantId === localParticipantIdRef.current;
+                    if (autoPlayTTSRef.current && enabledRef.current && !currentIsLocal) {
+                        queueAudioRef.current(event.data, 24000, participantId);
+                    } else if (currentIsLocal) {
+                        console.log(`[RemoteTranslation] ${participantId}: Skipping TTS for local participant`);
                     }
                 }
             };
@@ -258,7 +393,8 @@ export function useRemoteParticipantTranslation({
 
             ws.onclose = () => {
                 console.log(`[RemoteTranslation] ${participantId}: WebSocket closed`);
-                cleanupParticipantStream(participantId);
+                // Don't call cleanup here to avoid recursive issues
+                streamsRef.current.delete(participantId);
             };
 
         } catch (err) {
@@ -267,140 +403,33 @@ export function useRemoteParticipantTranslation({
             setError(error);
             onErrorRef.current?.(error);
         }
-    }, [autoPlayTTS, queueAudio]);
+    };
 
-    // Start audio capture for a participant
-    const startAudioCapture = useCallback(async (participantId: string, mediaStream: MediaStream) => {
-        const stream = streamsRef.current.get(participantId);
-        if (!stream || !stream.audioContext) return;
-
-        try {
-            // Load AudioWorklet
-            await stream.audioContext.audioWorklet.addModule('/audio-processor.js');
-
-            // Create source node
-            const sourceNode = stream.audioContext.createMediaStreamSource(mediaStream);
-            stream.sourceNode = sourceNode;
-
-            // Create worklet node
-            const workletNode = new AudioWorkletNode(stream.audioContext, 'audio-processor');
-            stream.workletNode = workletNode;
-
-            // Handle audio data
-            workletNode.port.onmessage = (event) => {
-                const { audioData } = event.data;
-                if (audioData) {
-                    stream.audioBuffer.push(new Float32Array(audioData));
-                }
-            };
-
-            // Connect (NOT to destination)
-            sourceNode.connect(workletNode);
-
-            // Start chunk interval
-            stream.chunkInterval = setInterval(() => {
-                if (stream.audioBuffer.length === 0) return;
-                if (!stream.ws || stream.ws.readyState !== WebSocket.OPEN) return;
-                if (!stream.isHandshakeComplete) return;
-
-                const totalLength = stream.audioBuffer.reduce((sum, arr) => sum + arr.length, 0);
-                if (totalLength === 0) return;
-
-                const combined = new Float32Array(totalLength);
-                let offset = 0;
-                for (const chunk of stream.audioBuffer) {
-                    combined.set(chunk, offset);
-                    offset += chunk.length;
-                }
-                stream.audioBuffer = [];
-
-                // Resample to 16kHz
-                const resampled = resample(combined, stream.audioContext.sampleRate, SAMPLE_RATE);
-                const int16Data = float32ToInt16(resampled);
-
-                stream.ws.send(int16Data.buffer);
-                console.log(`[RemoteTranslation] ${participantId}: Sent ${int16Data.length} samples`);
-            }, chunkIntervalMs);
-
-            console.log(`[RemoteTranslation] ${participantId}: Audio capture started`);
-
-        } catch (err) {
-            console.error(`[RemoteTranslation] ${participantId}: Failed to start audio capture:`, err);
-        }
-    }, [chunkIntervalMs]);
-
-    // Cleanup a participant stream
-    const cleanupParticipantStream = useCallback((participantId: string) => {
-        const stream = streamsRef.current.get(participantId);
-        if (!stream) return;
-
-        console.log(`[RemoteTranslation] Cleaning up stream for ${participantId}`);
-
-        if (stream.chunkInterval) {
-            clearInterval(stream.chunkInterval);
-        }
-
-        if (stream.workletNode) {
-            stream.workletNode.disconnect();
-        }
-
-        if (stream.sourceNode) {
-            stream.sourceNode.disconnect();
-        }
-
-        if (stream.audioContext && stream.audioContext.state !== 'closed') {
-            stream.audioContext.close();
-        }
-
-        if (stream.ws && stream.ws.readyState === WebSocket.OPEN) {
-            stream.ws.close();
-        }
-
-        streamsRef.current.delete(participantId);
-    }, []);
-
-    // Cleanup all streams
-    const cleanupAllStreams = useCallback(() => {
-        console.log(`[RemoteTranslation] Cleaning up all streams`);
-
-        streamsRef.current.forEach((_, participantId) => {
-            cleanupParticipantStream(participantId);
-        });
-
-        unduckAll();
-        stopAudio();
-        setTranscripts(new Map());
-    }, [cleanupParticipantStream, unduckAll, stopAudio]);
-
-    // Effect: Start/stop based on enabled
+    // Main effect: Manage streams based on sttEnabled and participant changes
     useEffect(() => {
-        if (enabled) {
-            console.log(`[RemoteTranslation] Starting translation for ${remoteParticipants.length} remote participants`);
-            setIsActive(true);
-
-            remoteParticipants.forEach(participant => {
-                createParticipantStream(participant);
-            });
-        } else {
-            console.log(`[RemoteTranslation] Stopping translation`);
+        if (!sttEnabled) {
+            console.log(`[RemoteTranslation] Stopping STT`);
             cleanupAllStreams();
             setIsActive(false);
+            return;
         }
-    }, [enabled]);
 
-    // Effect: Handle participant changes while active
-    useEffect(() => {
-        if (!enabled) return;
+        // Parse participant IDs from the memoized string
+        const currentIds = participantIds ? participantIds.split(',').filter(Boolean) : [];
 
-        const currentParticipantIds = new Set(remoteParticipants.map(p => p.identity));
+        console.log(`[RemoteTranslation] STT enabled, managing ${currentIds.length} participants (including local)`);
+        setIsActive(true);
+
+        const currentParticipantIds = new Set(currentIds);
         const existingStreamIds = new Set(streamsRef.current.keys());
 
+        // Find participants to add
+        const participantsToAdd = participants.filter(p => !existingStreamIds.has(p.identity));
+
         // Add new participants
-        remoteParticipants.forEach(participant => {
-            if (!existingStreamIds.has(participant.identity)) {
-                console.log(`[RemoteTranslation] New participant joined: ${participant.identity}`);
-                createParticipantStream(participant);
-            }
+        participantsToAdd.forEach(participant => {
+            console.log(`[RemoteTranslation] Creating stream for: ${participant.identity} (isLocal: ${participant.isLocal})`);
+            createParticipantStream(participant as RemoteParticipant);
         });
 
         // Remove departed participants
@@ -411,15 +440,26 @@ export function useRemoteParticipantTranslation({
             }
         });
 
-        setActiveParticipantCount(streamsRef.current.size);
-    }, [enabled, remoteParticipants, createParticipantStream, cleanupParticipantStream]);
+        setActiveParticipantCount(currentIds.length);
 
-    // Effect: Cleanup on unmount
+        // Cleanup on unmount or when sttEnabled changes
+        return () => {
+            // Only cleanup if sttEnabled is being turned off
+            if (!sttEnabledRef.current) {
+                cleanupAllStreams();
+            }
+        };
+    // Only depend on sttEnabled and participantIds - everything else uses refs
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [sttEnabled, participantIds]);
+
+    // Cleanup on unmount
     useEffect(() => {
         return () => {
             cleanupAllStreams();
         };
-    }, [cleanupAllStreams]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, []);
 
     return {
         isActive,

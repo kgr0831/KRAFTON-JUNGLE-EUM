@@ -17,7 +17,8 @@ export interface VoiceRecord {
     speaker: string;
     profileImg?: string;
     original: string;
-    translated: string;
+    translated?: string;      // 번역 모드일 때만 존재
+    targetLanguage?: string;  // 번역 언어 (ja, zh, en 등)
     timestamp: number;
 }
 
@@ -318,7 +319,9 @@ export default function ChatPanel({ roomId, onClose, onNewMessage, voiceRecords 
                                     {/* Translated text */}
                                     {record.translated && (
                                         <div className="flex items-start gap-2">
-                                            <span className="text-[10px] text-blue-500 bg-blue-50 px-1.5 py-0.5 rounded mt-0.5 flex-shrink-0">EN</span>
+                                            <span className="text-[10px] text-blue-500 bg-blue-50 px-1.5 py-0.5 rounded mt-0.5 flex-shrink-0 uppercase">
+                                                {record.targetLanguage || 'EN'}
+                                            </span>
                                             <p className="text-[13px] text-black leading-relaxed">{record.translated}</p>
                                         </div>
                                     )}

@@ -52,16 +52,22 @@ export default function WhiteboardCanvas() {
     // UI State
     const [isInteracting, setIsInteracting] = useState(false);
     const [isMiddlePanning, setIsMiddlePanning] = useState(false);
+    const [isDrawing, setIsDrawing] = useState(false);
     const [triggerLoad, setTriggerLoad] = useState(0);
 
     // LiveKit
     const room = useRoomContext();
     const participants = useParticipants();
 
-    // Cursor Hook
+    // Cursor Hook - pass tool state for cursor display
     const { remoteCursors, localCursor, broadcastCursor, handleCursorEvent } = useWhiteboardCursors({
         room,
         participantIdentities: participants.filter(p => !p.isLocal).map(p => p.identity),
+        toolState: {
+            tool: activeTool,
+            penColor: penColor,
+            isDrawing: isDrawing,
+        },
     });
 
     // Drawing function
@@ -162,6 +168,7 @@ export default function WhiteboardCanvas() {
             }
 
             isDrawing = true;
+            setIsDrawing(true);
             const startPoint = getLocalPoint(e.clientX, e.clientY);
             prevRawPoint = startPoint;
             prevRenderedPoint = startPoint;
@@ -283,6 +290,7 @@ export default function WhiteboardCanvas() {
             }
 
             isDrawing = false;
+            setIsDrawing(false);
             prevRawPoint = null;
             prevRenderedPoint = null;
             currentGraphicsRef.current = null;
@@ -301,8 +309,10 @@ export default function WhiteboardCanvas() {
             currentStroke = [];
         };
 
+        let resizeObserver: ResizeObserver | null = null;
+
         const initPixi = async () => {
-            const resizeObserver = new ResizeObserver((entries) => {
+            resizeObserver = new ResizeObserver((entries) => {
                 if (!appRef.current || !entries[0]) return;
                 const { width, height } = entries[0].contentRect;
                 appRef.current.renderer.resize(width, height);
@@ -341,6 +351,12 @@ export default function WhiteboardCanvas() {
         initPixi();
 
         return () => {
+            // Clean up ResizeObserver
+            if (resizeObserver) {
+                resizeObserver.disconnect();
+                resizeObserver = null;
+            }
+
             if (appRef.current) {
                 const canvas = appRef.current.canvas;
                 if (canvas) {

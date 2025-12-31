@@ -40,6 +40,7 @@ type Server struct {
 	roleHandler           *handler.RoleHandler
 	videoHandler          *handler.VideoHandler
 	whiteboardHandler     *handler.WhiteboardHandler
+	voiceRecordHandler    *handler.VoiceRecordHandler
 	jwtManager            *auth.JWTManager
 }
 
@@ -79,6 +80,7 @@ func New(cfg *config.Config, db *gorm.DB) *Server {
 	roleHandler := handler.NewRoleHandler(db)
 	videoHandler := handler.NewVideoHandler(cfg, db)
 	whiteboardHandler := handler.NewWhiteboardHandler(db)
+	voiceRecordHandler := handler.NewVoiceRecordHandler(db)
 
 	// S3 서비스 초기화 (선택적)
 	var s3Service *storage.S3Service
@@ -113,6 +115,7 @@ func New(cfg *config.Config, db *gorm.DB) *Server {
 		roleHandler:           roleHandler,
 		videoHandler:          videoHandler,
 		whiteboardHandler:     whiteboardHandler,
+		voiceRecordHandler:    voiceRecordHandler,
 		jwtManager:            jwtManager,
 	}
 }
@@ -219,6 +222,12 @@ func (s *Server) SetupRoutes() {
 	workspaceGroup.Get("/:workspaceId/meetings/:meetingId", s.meetingHandler.GetMeeting)
 	workspaceGroup.Post("/:workspaceId/meetings/:meetingId/start", s.meetingHandler.StartMeeting)
 	workspaceGroup.Post("/:workspaceId/meetings/:meetingId/end", s.meetingHandler.EndMeeting)
+
+	// Voice Record 라우트 (미팅 하위)
+	workspaceGroup.Get("/:workspaceId/meetings/:meetingId/voice-records", s.voiceRecordHandler.GetVoiceRecords)
+	workspaceGroup.Post("/:workspaceId/meetings/:meetingId/voice-records", s.voiceRecordHandler.CreateVoiceRecord)
+	workspaceGroup.Post("/:workspaceId/meetings/:meetingId/voice-records/bulk", s.voiceRecordHandler.CreateVoiceRecordBulk)
+	workspaceGroup.Delete("/:workspaceId/meetings/:meetingId/voice-records", s.voiceRecordHandler.DeleteVoiceRecords)
 
 	// Calendar 라우트 (워크스페이스 하위)
 	workspaceGroup.Get("/:workspaceId/events", s.calendarHandler.GetWorkspaceEvents)
