@@ -347,6 +347,7 @@ func (h *AudioHandler) aiUnifiedWorker(sess *session.Session) {
 					Text:          originalText,
 					Original:      originalText,
 					Translated:    "", // 아직 번역 없음
+					Language:      sess.GetLanguage(),
 					IsFinal:       true,
 				}
 				select {
@@ -370,6 +371,7 @@ func (h *AudioHandler) aiUnifiedWorker(sess *session.Session) {
 					Text:          translatedText,
 					Original:      originalText,
 					Translated:    translatedText,
+					Language:      sess.GetLanguage(),
 					IsFinal:       true,
 				}
 				select {
@@ -401,6 +403,7 @@ func (h *AudioHandler) aiUnifiedWorker(sess *session.Session) {
 					Text:          text,
 					Original:      originalText,
 					Translated:    text,
+					Language:      sess.GetLanguage(),
 					IsFinal:       true,
 				}
 				select {

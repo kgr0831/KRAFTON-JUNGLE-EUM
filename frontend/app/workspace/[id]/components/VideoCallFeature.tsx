@@ -86,7 +86,7 @@ function VideoCallContent({
                 return [...prev, {
                     id: `${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
                     speaker: data.participantName || data.participantId,
-                    profileImg: undefined,
+                    profileImg: data.profileImg,
                     original: data.original,
                     translated: isTranslationOpen ? data.translated : undefined,
                     targetLanguage: isTranslationOpen ? targetLanguage : undefined,
@@ -100,7 +100,7 @@ function VideoCallContent({
             const newRecord: VoiceRecord = {
                 id: `${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
                 speaker: data.participantName || data.participantId,
-                profileImg: undefined,
+                profileImg: data.profileImg,
                 original: data.original,
                 translated: undefined,
                 targetLanguage: undefined,
@@ -113,7 +113,7 @@ function VideoCallContent({
         if (isTranslationOpen && hasTranslation) {
             setCurrentSpeaker({
                 name: data.participantName || data.participantId,
-                profileImg: undefined,
+                profileImg: data.profileImg,
                 isLocal: false,
             });
             setCurrentOriginal(data.original);
