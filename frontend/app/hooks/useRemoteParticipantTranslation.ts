@@ -379,7 +379,7 @@ export function useRemoteParticipantTranslation({
                                 participantId: data.participantId || participantId,
                                 participantName: participant.name || participantId,
                                 profileImg: getParticipantProfileImg(participant),
-                                original: stripPrefixes(data.original || data.text),
+                                original: stripPrefixes(data.original) || stripPrefixes(data.text),
                                 translated: stripPrefixes(data.translated),
                                 isFinal: data.isFinal,
                             };
