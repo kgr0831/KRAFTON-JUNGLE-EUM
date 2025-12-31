@@ -526,6 +526,12 @@ class ApiClient {
     });
   }
 
+  async markAsRead(workspaceId: number, roomId: number): Promise<{ message: string }> {
+    return this.request(`/api/workspaces/${workspaceId}/chatrooms/${roomId}/read`, {
+      method: 'POST',
+    });
+  }
+
   async updateChatRoom(workspaceId: number, roomId: number, title: string): Promise<ChatRoom> {
     return this.request<ChatRoom>(`/api/workspaces/${workspaceId}/chatrooms/${roomId}`, {
       method: 'PUT',

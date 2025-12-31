@@ -140,6 +140,23 @@ export default function WorkspaceDetailPage() {
       );
     }
 
+    // DM 섹션 처리 (dm-[id])
+    if (activeSection.startsWith("dm-")) {
+      const roomId = parseInt(activeSection.replace("dm-", ""), 10);
+      const canSendMessages = true; // DM은 기본적으로 전송 가능
+
+      return (
+        <ChatSection
+          key={activeSection}
+          workspaceId={workspace.id}
+          roomId={roomId}
+          onRoomTitleChange={setCurrentChatRoomTitle}
+          onBack={() => setActiveSection("members")}
+          canSendMessages={canSendMessages}
+        />
+      );
+    }
+
     // 채팅방 처리
     if (activeSection.startsWith("chat-")) {
       const roomId = parseInt(activeSection.replace("chat-", ""), 10);
