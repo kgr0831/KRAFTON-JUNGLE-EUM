@@ -28,9 +28,16 @@ interface WorkspaceMember {
   id: number;
   user_id: number;
   role_id?: number;
-  status?: string; // PENDING, ACTIVE, LEFT
+  status: 'PENDING' | 'ACTIVE'; // Required field with union type
   joined_at: string;
   user?: UserSearchResult;
+  role?: {
+    id: number;
+    name: string;
+    color?: string;
+    is_default: boolean;
+    permissions: string[];
+  };
 }
 
 interface Workspace {
@@ -50,6 +57,15 @@ interface WorkspacesResponse {
 interface CreateWorkspaceRequest {
   name: string;
   member_ids?: number[];
+}
+
+interface Role {
+  id: number;
+  workspace_id: number;
+  name: string;
+  color?: string;
+  is_default: boolean;
+  permissions?: { permission_code: string }[];
 }
 
 // 채팅 관련 타입
@@ -221,6 +237,38 @@ interface WhiteboardResponse {
   canRedo: boolean;
 }
 
+// 음성 기록 관련 타입
+interface VoiceRecord {
+  id: number;
+  meeting_id: number;
+  speaker_id?: number;
+  speaker_name: string;
+  original: string;
+  translated?: string;
+  target_lang?: string;
+  created_at: string;
+  speaker?: UserSearchResult;
+}
+
+interface VoiceRecordsResponse {
+  meeting_id: number;
+  records: VoiceRecord[];
+  total: number;
+  limit: number;
+  offset: number;
+}
+
+interface CreateVoiceRecordRequest {
+  speaker_name: string;
+  original: string;
+  translated?: string;
+  target_lang?: string;
+}
+
+interface CreateVoiceRecordBulkRequest {
+  records: CreateVoiceRecordRequest[];
+}
+
 // HTTP-only 쿠키 기반 인증 (XSS 방지)
 class ApiClient {
   private isLoggedIn: boolean = false;
@@ -230,10 +278,15 @@ class ApiClient {
     options: RequestInit = {},
     skipAutoRefresh: boolean = false
   ): Promise<T> {
-    const headers: HeadersInit = {
+    const headers: Record<string, string> = {
       'Content-Type': 'application/json',
-      ...options.headers,
+      ...(options.headers as Record<string, string>),
     };
+
+    // FormData인 경우 Content-Type 헤더 제거 (브라우저가 자동으로 boundary 설정)
+    if (options.body instanceof FormData) {
+      delete headers['Content-Type'];
+    }
 
     const response = await fetch(`${API_BASE_URL}${endpoint}`, {
       ...options,
@@ -324,6 +377,26 @@ class ApiClient {
     }
   }
 
+  // 프로필 수정
+  async updateProfile(data: FormData | { nickname: string; profile_img?: string }): Promise<AuthResponse['user']> {
+    let body: BodyInit;
+    const headers: HeadersInit = {};
+
+    if (data instanceof FormData) {
+      body = data;
+      // Content-Type header should be let empty for FormData to let the browser set it with boundary
+    } else {
+      body = JSON.stringify(data);
+      headers['Content-Type'] = 'application/json';
+    }
+
+    return this.request<AuthResponse['user']>('/auth/me', {
+      method: 'PUT',
+      body,
+      headers,
+    });
+  }
+
   // 유저 검색 (닉네임 또는 이메일)
   async searchUsers(query: string): Promise<SearchUsersResponse> {
     if (query.length < 2) {
@@ -364,6 +437,53 @@ class ApiClient {
   async leaveWorkspace(workspaceId: number): Promise<{ message: string }> {
     return this.request(`/api/workspaces/${workspaceId}/leave`, {
       method: 'DELETE',
+    });
+  }
+
+  // 워크스페이스 수정
+  async updateWorkspace(workspaceId: number, name: string): Promise<Workspace> {
+    return this.request<Workspace>(`/api/workspaces/${workspaceId}`, {
+      method: 'PUT',
+      body: JSON.stringify({ name }),
+    });
+  }
+
+  // 워크스페이스 삭제
+  async deleteWorkspace(workspaceId: number): Promise<void> {
+    await this.request(`/api/workspaces/${workspaceId}`, {
+      method: 'DELETE',
+    });
+  }
+
+  // ========== 역할(Role) API ==========
+  async getRoles(workspaceId: number): Promise<Role[]> {
+    return this.request<Role[]>(`/api/workspaces/${workspaceId}/roles`);
+  }
+
+  async createRole(workspaceId: number, name: string, color?: string, permissions?: string[]): Promise<Role> {
+    return this.request<Role>(`/api/workspaces/${workspaceId}/roles`, {
+      method: "POST",
+      body: JSON.stringify({ name, color, permissions }),
+    });
+  }
+
+  async updateRole(workspaceId: number, roleId: number, name: string, color?: string, permissions?: string[]): Promise<Role> {
+    return this.request<Role>(`/api/workspaces/${workspaceId}/roles/${roleId}`, {
+      method: "PUT",
+      body: JSON.stringify({ name, color, permissions }),
+    });
+  }
+
+  async deleteRole(workspaceId: number, roleId: number): Promise<void> {
+    await this.request(`/api/workspaces/${workspaceId}/roles/${roleId}`, {
+      method: 'DELETE',
+    });
+  }
+
+  async updateMemberRole(workspaceId: number, userId: number, roleId: number): Promise<void> {
+    await this.request(`/api/workspaces/${workspaceId}/members/${userId}/role`, {
+      method: 'PUT',
+      body: JSON.stringify({ role_id: roleId }),
     });
   }
 
@@ -616,6 +736,14 @@ class ApiClient {
     });
   }
 
+  async getRoomParticipants(roomName: string): Promise<{ roomName: string; participants: { identity: string; name: string; joinedAt: number }[] }> {
+    return this.request(`/api/video/participants?roomName=${encodeURIComponent(roomName)}`);
+  }
+
+  async getAllRoomsParticipants(roomNames: string[]): Promise<Record<string, { identity: string; name: string; joinedAt: number }[]>> {
+    return this.request(`/api/video/rooms/participants?rooms=${roomNames.map(r => encodeURIComponent(r)).join(',')}`);
+  }
+
   // ========== 화이트보드 API ==========
   async getWhiteboardHistory(roomName: string): Promise<WhiteboardResponse> {
     return this.request<WhiteboardResponse>(`/api/whiteboard?room=${roomName}`);
@@ -625,6 +753,33 @@ class ApiClient {
     return this.request<WhiteboardResponse>('/api/whiteboard', {
       method: 'POST',
       body: JSON.stringify({ room: roomName, ...action }),
+    });
+  }
+
+  // ========== 음성 기록 API ==========
+  async getVoiceRecords(workspaceId: number, meetingId: number, limit = 100, offset = 0): Promise<VoiceRecordsResponse> {
+    return this.request<VoiceRecordsResponse>(
+      `/api/workspaces/${workspaceId}/meetings/${meetingId}/voice-records?limit=${limit}&offset=${offset}`
+    );
+  }
+
+  async createVoiceRecord(workspaceId: number, meetingId: number, data: CreateVoiceRecordRequest): Promise<VoiceRecord> {
+    return this.request<VoiceRecord>(`/api/workspaces/${workspaceId}/meetings/${meetingId}/voice-records`, {
+      method: 'POST',
+      body: JSON.stringify(data),
+    });
+  }
+
+  async createVoiceRecordBulk(workspaceId: number, meetingId: number, records: CreateVoiceRecordRequest[]): Promise<{ message: string; count: number }> {
+    return this.request(`/api/workspaces/${workspaceId}/meetings/${meetingId}/voice-records/bulk`, {
+      method: 'POST',
+      body: JSON.stringify({ records }),
+    });
+  }
+
+  async deleteVoiceRecords(workspaceId: number, meetingId: number): Promise<{ message: string; count: number }> {
+    return this.request(`/api/workspaces/${workspaceId}/meetings/${meetingId}/voice-records`, {
+      method: 'DELETE',
     });
   }
 }
@@ -661,4 +816,10 @@ export type {
   // Notification
   Notification,
   NotificationsResponse,
+  // Role
+  Role,
+  // Voice Record
+  VoiceRecord,
+  VoiceRecordsResponse,
+  CreateVoiceRecordRequest,
 };

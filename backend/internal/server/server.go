@@ -38,6 +38,10 @@ type Server struct {
 	meetingHandler        *handler.MeetingHandler
 	calendarHandler       *handler.CalendarHandler
 	storageHandler        *handler.StorageHandler
+	roleHandler           *handler.RoleHandler
+	videoHandler          *handler.VideoHandler
+	whiteboardHandler     *handler.WhiteboardHandler
+	voiceRecordHandler    *handler.VoiceRecordHandler
 	jwtManager            *auth.JWTManager
 }
 
@@ -74,6 +78,10 @@ func New(cfg *config.Config, db *gorm.DB) *Server {
 	chatWSHandler := handler.NewChatWSHandler(db)
 	meetingHandler := handler.NewMeetingHandler(db)
 	calendarHandler := handler.NewCalendarHandler(db)
+	roleHandler := handler.NewRoleHandler(db)
+	videoHandler := handler.NewVideoHandler(cfg, db)
+	whiteboardHandler := handler.NewWhiteboardHandler(db)
+	voiceRecordHandler := handler.NewVoiceRecordHandler(db)
 
 	// S3 서비스 초기화 (선택적)
 	var s3Service *storage.S3Service
@@ -105,6 +113,10 @@ func New(cfg *config.Config, db *gorm.DB) *Server {
 		meetingHandler:        meetingHandler,
 		calendarHandler:       calendarHandler,
 		storageHandler:        storageHandler,
+		roleHandler:           roleHandler,
+		videoHandler:          videoHandler,
+		whiteboardHandler:     whiteboardHandler,
+		voiceRecordHandler:    voiceRecordHandler,
 		jwtManager:            jwtManager,
 	}
 }
@@ -130,16 +142,16 @@ func (s *Server) SetupMiddleware() {
 		AllowMethods:     "GET, POST, PUT, DELETE, OPTIONS",
 		AllowCredentials: true,
 	}))
+
+	// 정적 파일 제공 (업로드된 파일)
+	s.app.Static("/uploads", "./uploads")
 }
 
 // SetupRoutes 라우트 설정
 func (s *Server) SetupRoutes() {
 	// 헬스체크 엔드포인트
 	s.app.Get("/health", func(c *fiber.Ctx) error {
-		return c.JSON(fiber.Map{
-			"status":    "ok",
-			"timestamp": time.Now().Unix(),
-		})
+		return c.SendStatus(fiber.StatusOK)
 	})
 
 	// Rate Limiter 설정 (인증 엔드포인트용 - Brute Force 방지)
@@ -162,6 +174,7 @@ func (s *Server) SetupRoutes() {
 	authGroup.Post("/refresh", authLimiter, s.authHandler.RefreshToken)
 	authGroup.Post("/logout", auth.AuthMiddleware(s.jwtManager), s.authHandler.Logout) // 인증된 사용자만
 	authGroup.Get("/me", auth.AuthMiddleware(s.jwtManager), s.authHandler.GetMe)
+	authGroup.Put("/me", auth.AuthMiddleware(s.jwtManager), s.userHandler.UpdateUser)
 
 	// User 라우트 그룹 (인증 필요)
 	userGroup := s.app.Group("/api/users", auth.AuthMiddleware(s.jwtManager))
@@ -180,7 +193,17 @@ func (s *Server) SetupRoutes() {
 	workspaceGroup.Get("/", s.workspaceHandler.GetMyWorkspaces)
 	workspaceGroup.Get("/:id", s.workspaceHandler.GetWorkspace)
 	workspaceGroup.Post("/:id/members", s.workspaceHandler.AddMembers)
+	workspaceGroup.Post("/:id/members", s.workspaceHandler.AddMembers)
 	workspaceGroup.Delete("/:id/leave", s.workspaceHandler.LeaveWorkspace)
+	workspaceGroup.Put("/:id/members/:userId/role", s.workspaceHandler.UpdateMemberRole)
+	workspaceGroup.Put("/:id", s.workspaceHandler.UpdateWorkspace)
+	workspaceGroup.Delete("/:id", s.workspaceHandler.DeleteWorkspace)
+
+	// Role 라우트 (워크스페이스 하위)
+	workspaceGroup.Get("/:id/roles", s.roleHandler.GetRoles)
+	workspaceGroup.Post("/:id/roles", s.roleHandler.CreateRole)
+	workspaceGroup.Put("/:id/roles/:roleId", s.roleHandler.UpdateRole)
+	workspaceGroup.Delete("/:id/roles/:roleId", s.roleHandler.DeleteRole)
 
 	// Chat 라우트 (워크스페이스 하위) - 레거시
 	workspaceGroup.Get("/:workspaceId/chats", s.chatHandler.GetWorkspaceChats)
@@ -205,6 +228,12 @@ func (s *Server) SetupRoutes() {
 	workspaceGroup.Get("/:workspaceId/dm", s.chatHandler.GetMyDMs)
 	workspaceGroup.Post("/:workspaceId/meetings/:meetingId/end", s.meetingHandler.EndMeeting)
 
+	// Voice Record 라우트 (미팅 하위)
+	workspaceGroup.Get("/:workspaceId/meetings/:meetingId/voice-records", s.voiceRecordHandler.GetVoiceRecords)
+	workspaceGroup.Post("/:workspaceId/meetings/:meetingId/voice-records", s.voiceRecordHandler.CreateVoiceRecord)
+	workspaceGroup.Post("/:workspaceId/meetings/:meetingId/voice-records/bulk", s.voiceRecordHandler.CreateVoiceRecordBulk)
+	workspaceGroup.Delete("/:workspaceId/meetings/:meetingId/voice-records", s.voiceRecordHandler.DeleteVoiceRecords)
+
 	// Calendar 라우트 (워크스페이스 하위)
 	workspaceGroup.Get("/:workspaceId/events", s.calendarHandler.GetWorkspaceEvents)
 	workspaceGroup.Post("/:workspaceId/events", s.calendarHandler.CreateEvent)
@@ -224,6 +253,15 @@ func (s *Server) SetupRoutes() {
 	workspaceGroup.Post("/:workspaceId/files/confirm", s.storageHandler.ConfirmUpload)
 	workspaceGroup.Get("/:workspaceId/files/:fileId/download", s.storageHandler.GetDownloadURL)
 
+	// Video Call 라우트
+	s.app.Post("/api/video/token", auth.AuthMiddleware(s.jwtManager), s.videoHandler.GenerateToken)
+	s.app.Get("/api/video/participants", auth.AuthMiddleware(s.jwtManager), s.videoHandler.GetRoomParticipants)
+	s.app.Get("/api/video/rooms/participants", auth.AuthMiddleware(s.jwtManager), s.videoHandler.GetAllRoomsParticipants)
+
+	// Whiteboard 라우트
+	s.app.Get("/api/whiteboard", s.whiteboardHandler.GetWhiteboard)
+	s.app.Post("/api/whiteboard", s.whiteboardHandler.HandleWhiteboard)
+
 	// WebSocket 업그레이드 체크 미들웨어
 	s.app.Use("/ws", func(c *fiber.Ctx) error {
 		if websocket.IsWebSocketUpgrade(c) {
@@ -234,7 +272,28 @@ func (s *Server) SetupRoutes() {
 	})
 
 	// WebSocket 오디오 스트리밍 엔드포인트
-	s.app.Get("/ws/audio", websocket.New(s.handler.HandleWebSocket, websocket.Config{
+	s.app.Get("/ws/audio", func(c *fiber.Ctx) error {
+		if !websocket.IsWebSocketUpgrade(c) {
+			return fiber.ErrUpgradeRequired
+		}
+
+		// 언어 파라미터 추출 (기본값: en)
+		lang := c.Query("lang", "en")
+		// 지원하는 언어만 허용
+		switch lang {
+		case "ko", "en", "ja", "zh":
+			// 유효한 언어
+		default:
+			lang = "en"
+		}
+		c.Locals("lang", lang)
+
+		// 발화자 식별 ID 추출 (원격 참가자의 identity)
+		participantId := c.Query("participantId", "")
+		c.Locals("participantId", participantId)
+
+		return c.Next()
+	}, websocket.New(s.handler.HandleWebSocket, websocket.Config{
 		ReadBufferSize:  s.cfg.WebSocket.ReadBufferSize,
 		WriteBufferSize: s.cfg.WebSocket.WriteBufferSize,
 	}))
@@ -319,6 +378,7 @@ func (s *Server) SetupRoutes() {
 		s.db.Table("users").Select("nickname").Where("id = ?", claims.UserID).Scan(&user)
 
 		c.Locals("roomId", int64(roomID))
+		c.Locals("workspaceId", int64(workspaceID))
 		c.Locals("userId", claims.UserID)
 		c.Locals("nickname", user.Nickname)
 

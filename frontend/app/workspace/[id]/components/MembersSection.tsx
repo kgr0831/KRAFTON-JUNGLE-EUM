@@ -43,9 +43,9 @@ export default function MembersSection({ workspace, onMembersUpdate, onSectionCh
     fetchUnreadCounts();
   }, [fetchUnreadCounts]);
 
-  // 주기적으로 안읽음 개수 갱신 (10초마다)
+  // 주기적으로 안읽음 개수 갱신 (3초마다)
   useEffect(() => {
-    const interval = setInterval(fetchUnreadCounts, 10000);
+    const interval = setInterval(fetchUnreadCounts, 3000);
     return () => clearInterval(interval);
   }, [fetchUnreadCounts]);
 
