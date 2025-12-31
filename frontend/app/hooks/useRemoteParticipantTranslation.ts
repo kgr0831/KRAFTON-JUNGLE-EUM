@@ -351,11 +351,21 @@ export function useRemoteParticipantTranslation({
                     try {
                         const data = JSON.parse(event.data);
                         if (data.type === 'transcript') {
+                            // 접두사 제거 함수
+                            const stripPrefixes = (text: string | undefined): string => {
+                                if (!text) return '';
+                                return text
+                                    .replace(/^\[FINAL\]\s*/i, '')
+                                    .replace(/^\[LLM\]\s*/i, '')
+                                    .replace(/^\[PARTIAL\]\s*/i, '')
+                                    .trim();
+                            };
+
                             const transcriptData: RemoteTranscriptData = {
                                 participantId: data.participantId || participantId,
                                 participantName: participant.name || participantId,
-                                original: data.original || data.text,
-                                translated: data.translated || data.text,
+                                original: stripPrefixes(data.original || data.text),
+                                translated: stripPrefixes(data.translated),
                                 isFinal: data.isFinal,
                             };
 
