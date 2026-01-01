@@ -440,6 +440,13 @@ class ApiClient {
     });
   }
 
+  // 워크스페이스 멤버 강퇴
+  async kickMember(workspaceId: number, userId: number): Promise<{ message: string }> {
+    return this.request(`/api/workspaces/${workspaceId}/members/${userId}`, {
+      method: 'DELETE',
+    });
+  }
+
   // 워크스페이스 수정
   async updateWorkspace(workspaceId: number, name: string): Promise<Workspace> {
     return this.request<Workspace>(`/api/workspaces/${workspaceId}`, {

@@ -102,7 +102,7 @@ func New(cfg *config.Config, db *gorm.DB) *Server {
 		app:                   app,
 		cfg:                   cfg,
 		db:                    db,
-		handler:               handler.NewAudioHandler(cfg),
+		handler:               handler.NewAudioHandler(cfg, db),
 		authHandler:           authHandler,
 		userHandler:           userHandler,
 		workspaceHandler:      workspaceHandler,
@@ -201,6 +201,7 @@ func (s *Server) SetupRoutes() {
 	workspaceGroup.Post("/:id/members", s.workspaceHandler.AddMembers)
 	workspaceGroup.Delete("/:id/leave", s.workspaceHandler.LeaveWorkspace)
 	workspaceGroup.Put("/:id/members/:userId/role", s.workspaceHandler.UpdateMemberRole)
+	workspaceGroup.Delete("/:id/members/:userId", s.workspaceHandler.KickMember)
 	workspaceGroup.Put("/:id", s.workspaceHandler.UpdateWorkspace)
 	workspaceGroup.Delete("/:id", s.workspaceHandler.DeleteWorkspace)
 
