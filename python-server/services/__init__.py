@@ -1,4 +1,4 @@
-# Services module - ConversationServicer is in server.py for now
-# This can be expanded as needed
+"""Services module - gRPC service implementations"""
+from services.conversation import ConversationServicer
 
-__all__ = []
+__all__ = ["ConversationServicer"]

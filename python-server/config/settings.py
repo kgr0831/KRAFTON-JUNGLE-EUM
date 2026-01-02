@@ -1,5 +1,6 @@
 """
-Configuration settings for AI Server
+Configuration settings for AI Server v10
+Multi-Model STT, Room Cache, Hallucination Filter 지원
 """
 
 import os
@@ -17,16 +18,70 @@ class Config:
     CHUNK_BYTES = int(BYTES_PER_SECOND * CHUNK_DURATION_MS / 1000)  # 48000 bytes
 
     # 실시간 번역: 문장 완성도 vs 속도 밸런스
-    SENTENCE_MAX_DURATION_MS = 2500  # 문장 최대 대기 시간 (2.5초 - 문장 완성을 위해)
-    SENTENCE_MAX_BYTES = int(BYTES_PER_SECOND * SENTENCE_MAX_DURATION_MS / 1000)  # 80000 bytes
+    SENTENCE_MAX_DURATION_MS = 2500  # 문장 최대 대기 시간 (2.5초)
+    SENTENCE_MAX_BYTES = int(BYTES_PER_SECOND * SENTENCE_MAX_DURATION_MS / 1000)
 
-    # VAD settings - 침묵 감지로 빠르게 전송
-    SILENCE_THRESHOLD_RMS = 30  # RMS 침묵 임계값
-    SILENCE_DURATION_MS = 350   # 문장 끝 감지용 침묵 지속 시간 (350ms)
-    SILENCE_FRAMES = int(SILENCE_DURATION_MS / 100)  # 100ms 프레임 기준
+    # VAD settings
+    SILENCE_THRESHOLD_RMS = 30
+    SILENCE_DURATION_MS = 350  # 문장 끝 감지용 침묵 지속 시간
+    SILENCE_FRAMES = int(SILENCE_DURATION_MS / 100)
+
+    # ==========================================================================
+    # STT Backend Configuration
+    # ==========================================================================
+    # "multi" (language-specific), "whisper" (single model), or "transcribe" (AWS)
+    STT_BACKEND = os.getenv("STT_BACKEND", "multi")
+
+    # Multi-Model STT Configuration (Language-Specific Models)
+    MULTI_MODEL_STT = {
+        "en": {
+            "type": "nemo",
+            "model": "nvidia/canary-1b",
+            "description": "NVIDIA Canary - Multilingual (English focused)",
+        },
+        "ko": {
+            "type": "whisper",
+            "model": "SungBeom/whisper-small-ko",
+            "description": "Korean fine-tuned Whisper",
+        },
+        "ja": {
+            "type": "whisper",
+            "model": "kotoba-tech/kotoba-whisper-v2.0",
+            "description": "Japanese fine-tuned Whisper (Kotoba)",
+        },
+        "zh": {
+            "type": "whisper",
+            "model": "BELLE-2/Belle-whisper-large-v3-zh",
+            "description": "Chinese fine-tuned Whisper (BELLE)",
+        },
+    }
+
+    # Fallback model for unsupported languages
+    FALLBACK_MODEL = {
+        "type": "whisper",
+        "model": "large-v3-turbo",
+        "description": "OpenAI Whisper large-v3-turbo (multilingual fallback)",
+    }
+
+    # Single Model Settings (when STT_BACKEND="whisper")
+    WHISPER_MODEL_SIZE = os.getenv("WHISPER_MODEL", "large-v3-turbo")
+    WHISPER_DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+    WHISPER_COMPUTE_TYPE = "int8_float16" if torch.cuda.is_available() else "int8"
+
+    # Real-time optimized parameters
+    WHISPER_BEAM_SIZE = 1
+    WHISPER_BEST_OF = 1
+    WHISPER_TEMPERATURE = 0.0
+
+    # Language code mappings for Whisper
+    WHISPER_LANG_CODES = {
+        "ko": "ko", "en": "en", "ja": "ja", "zh": "zh",
+        "es": "es", "fr": "fr", "de": "de", "pt": "pt",
+        "ru": "ru", "ar": "ar", "hi": "hi", "tr": "tr",
+    }
 
     # Translation backend: "aws" (fast) or "qwen" (local LLM)
-    TRANSLATION_BACKEND = os.getenv("TRANSLATION_BACKEND", "aws")  # AWS Translate가 기본값 (10x 더 빠름)
+    TRANSLATION_BACKEND = os.getenv("TRANSLATION_BACKEND", "aws")
 
     # Amazon Transcribe Language Codes
     TRANSCRIBE_LANG_CODES = {
@@ -110,3 +165,24 @@ class Config:
 
     # Minimum text length for TTS (characters)
     MIN_TTS_TEXT_LENGTH = 2
+
+    # ==========================================================================
+    # Hallucination Filter Settings
+    # ==========================================================================
+    # Audio artifact patterns - NOT real speech, just transcription artifacts
+    AUDIO_ARTIFACT_PATTERNS = {
+        "[음악]", "[音楽]", "[music]", "[applause]", "[laughter]",
+        "[박수]", "[웃음]", "♪", "♫", "...", "…",
+    }
+
+    # Minimum RMS threshold for hallucination detection
+    HALLUCINATION_RMS_THRESHOLD = 0.005
+
+    # Minimum audio duration to process (seconds)
+    MIN_AUDIO_DURATION = 0.3  # 300ms minimum
+
+    # ==========================================================================
+    # Room Cache Settings
+    # ==========================================================================
+    CACHE_TTL_SECONDS = 10  # 캐시 유효 시간 (10초)
+    CACHE_CLEANUP_INTERVAL = 30  # 캐시 정리 간격 (30초)

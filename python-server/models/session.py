@@ -51,6 +51,11 @@ class SessionState:
     silence_skipped: int = 0
     sentences_completed: int = 0
 
+    # Latency tracking
+    total_stt_latency_ms: float = 0
+    total_translation_latency_ms: float = 0
+    total_tts_latency_ms: float = 0
+
     def get_target_languages(self) -> Set[str]:
         """번역이 활성화된 참가자들의 타겟 언어 목록"""
         languages = set()
