@@ -803,7 +803,6 @@ export function useRemoteParticipantTranslation({
         setIsActive(true);
 
         const currentParticipantIds = new Set(currentIds);
-        const existingStreamIds = new Set(streamsRef.current.keys());
 
         // Find REMOTE participants with available audio tracks
         const remoteAudioTracks = audioTracks.filter(t =>
@@ -818,16 +817,20 @@ export function useRemoteParticipantTranslation({
         })));
 
         // Add new remote participants that have audio tracks available
+        // NOTE: Check against streamsRef.current directly (not a snapshot) to handle
+        // cases where streams were just cleaned up due to metadata changes
         remoteAudioTracks.forEach(trackRef => {
             const participantId = trackRef.participant.identity;
-            if (!existingStreamIds.has(participantId)) {
+            // Check current state of streams, not a pre-cleanup snapshot
+            if (!streamsRef.current.has(participantId)) {
                 console.log(`[RemoteTranslation] Creating stream for REMOTE: ${participantId} (I am: ${localId})`);
                 createParticipantStream(trackRef.participant as RemoteParticipant);
             }
         });
 
         // Remove departed participants
-        existingStreamIds.forEach(participantId => {
+        // Check current streams and remove those whose participants are no longer in the room
+        streamsRef.current.forEach((_, participantId) => {
             if (!currentParticipantIds.has(participantId)) {
                 console.log(`[RemoteTranslation] Participant left: ${participantId}`);
                 cleanupParticipantStream(participantId);

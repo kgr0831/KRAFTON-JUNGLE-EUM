@@ -266,54 +266,26 @@ class Config:
         "嗯", "啊", "哦", "呃", "好", "是",
     }
 
-    # Whisper hallucination patterns to filter out
-    # These appear when audio is silent, too short, or unclear
-    HALLUCINATION_PATTERNS = {
-        # Korean hallucinations
-        "감사합니다",
-        "시청해 주셔서 감사합니다",
-        "한글자막 by",
-        "자막 by",
-        "자막 제공",
-        "구독과 좋아요",
-        "mbc 뉴스",
-        "kbs 뉴스",
-        "sbs 뉴스",
-        "이덕영입니다",
-        "끝",
-        # English hallucinations
-        "thank you",
-        "thanks for watching",
-        "thanks for listening",
-        "subscribe",
-        "please subscribe",
-        "like and subscribe",
-        "see you next time",
-        "bye",
-        "goodbye",
-        "the end",
-        "subtitles by",
-        "captions by",
-        "translated by",
-        # Japanese hallucinations
-        "ありがとうございました",
-        "ご視聴ありがとう",
-        "字幕",
-        # Chinese hallucinations
-        "谢谢",
-        "谢谢观看",
-        "感谢收看",
-        "字幕",
-        # Common noise patterns
-        "...",
-        "…",
-        "♪",
-        "♫",
+    # Audio artifact patterns - these are NOT real speech, just transcription artifacts
+    # NOTE: We do NOT filter based on text content (e.g., "감사합니다") because
+    # users might actually say those words. Only filter clear non-speech artifacts.
+    AUDIO_ARTIFACT_PATTERNS = {
+        "[음악]",
         "[音楽]",
         "[music]",
         "[applause]",
         "[laughter]",
+        "[박수]",
+        "[웃음]",
+        "♪",
+        "♫",
+        "...",  # Only when it's the entire text
+        "…",    # Only when it's the entire text
     }
+
+    # Minimum RMS threshold for hallucination detection
+    # If audio RMS is below this AND we get text, it's likely hallucination
+    HALLUCINATION_RMS_THRESHOLD = 0.005
 
     # Minimum audio duration to process (seconds) - skip very short audio
     MIN_AUDIO_DURATION = 0.3  # 300ms minimum
@@ -978,36 +950,50 @@ class ModelManager:
         print(f"Warmup completed in {warmup_time:.2f}s")
         print("=" * 70 + "\n")
 
-    def _is_hallucination(self, text: str) -> bool:
+    def _is_audio_artifact(self, text: str) -> bool:
         """
-        Check if the transcribed text is a Whisper hallucination.
+        Check if the transcribed text is a non-speech audio artifact.
 
-        Whisper often produces these when audio is silent, very short, or unclear.
+        NOTE: We do NOT filter based on text content like "감사합니다" because
+        users might actually say those words. Only filter clear artifacts like [music], ♪, etc.
         """
         if not text:
             return False
 
         text_lower = text.lower().strip()
 
-        # Exact match check
-        if text_lower in Config.HALLUCINATION_PATTERNS:
+        # Only filter if the entire text is an artifact pattern
+        if text_lower in Config.AUDIO_ARTIFACT_PATTERNS:
             return True
 
-        # Partial match check (for patterns like "한글자막 by 한효정")
-        for pattern in Config.HALLUCINATION_PATTERNS:
-            if pattern in text_lower:
+        # Check for repetitive single-character patterns (e.g., "음 음 음 음 음")
+        # This is likely microphone noise, not speech
+        words = text_lower.split()
+        if len(words) >= 5:
+            # Only filter if ALL words are exactly the same single character
+            if len(set(words)) == 1 and len(words[0]) == 1:
                 return True
 
-        # Check for repetitive patterns (e.g., "음 음 음 음 음")
-        words = text_lower.split()
-        if len(words) >= 3:
-            # If all words are the same (repetition)
-            if len(set(words)) == 1:
-                return True
-            # If most words are very short (likely noise)
-            short_words = sum(1 for w in words if len(w) <= 1)
-            if short_words / len(words) > 0.7:
-                return True
+        return False
+
+    def _is_likely_hallucination(self, text: str, audio_rms: float, no_speech_prob: float) -> bool:
+        """
+        Check if transcription is likely a hallucination based on audio characteristics.
+
+        Uses audio energy (RMS) and Whisper's no_speech_prob to detect hallucinations,
+        NOT the text content itself.
+        """
+        if not text:
+            return False
+
+        # If audio is very quiet but we got text, it's likely hallucination
+        if audio_rms < Config.HALLUCINATION_RMS_THRESHOLD and len(text) > 3:
+            return True
+
+        # High no_speech probability with text is suspicious
+        # (This is already checked per-segment, but double-check combined result)
+        if no_speech_prob > 0.7 and len(text) > 5:
+            return True
 
         return False
 
@@ -1169,20 +1155,24 @@ class ModelManager:
 
                 # Collect all segments
                 texts = []
+                max_no_speech_prob = 0.0
+
                 for segment in segments:
                     segment_text = segment.text.strip()
+                    max_no_speech_prob = max(max_no_speech_prob, segment.no_speech_prob)
 
                     # Skip segments with high no_speech probability
-                    if segment.no_speech_prob > 0.5:
+                    if segment.no_speech_prob > 0.6:
                         DebugLogger.log("STT_FILTER", f"Filtered high no_speech_prob", {
                             "text": segment_text[:30],
                             "no_speech_prob": f"{segment.no_speech_prob:.2f}"
                         })
                         continue
 
-                    # Check for hallucination (Whisper-specific)
-                    if self._is_hallucination(segment_text):
-                        DebugLogger.log("STT_FILTER", f"Filtered hallucination", {
+                    # Only filter clear audio artifacts (e.g., [music], ♪)
+                    # NOT text content like "감사합니다" - users might actually say that
+                    if self._is_audio_artifact(segment_text):
+                        DebugLogger.log("STT_FILTER", f"Filtered audio artifact", {
                             "text": segment_text[:50]
                         })
                         continue
@@ -1193,9 +1183,18 @@ class ModelManager:
                 result_text = " ".join(texts).strip()
                 confidence = info.language_probability if info.language_probability else 0.95
 
-                # Final hallucination check on combined text (Whisper-specific)
-                if self._is_hallucination(result_text):
-                    DebugLogger.log("STT_FILTER", f"Filtered combined hallucination", {
+                # Final check: audio-based hallucination detection
+                # If audio was very quiet but we got text, it's likely hallucination
+                if self._is_likely_hallucination(result_text, audio_rms, max_no_speech_prob):
+                    DebugLogger.log("STT_FILTER", f"Filtered likely hallucination (low audio energy)", {
+                        "text": result_text[:50],
+                        "rms": f"{audio_rms:.4f}"
+                    })
+                    result_text = ""
+
+                # Also check for audio artifacts in combined text
+                if result_text and self._is_audio_artifact(result_text):
+                    DebugLogger.log("STT_FILTER", f"Filtered audio artifact", {
                         "text": result_text[:50]
                     })
                     result_text = ""
