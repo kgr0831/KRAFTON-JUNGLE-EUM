@@ -74,8 +74,13 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         custom_status_text: userData.custom_status_text,
         custom_status_emoji: userData.custom_status_emoji,
       });
-    } catch (e) {
-      console.error("[AuthProvider] getMe failed (401 expected if not logged in):", e);
+    } catch (e: any) {
+      if (e.message === 'Authentication required') {
+        // Not logged in - this is expected behavior for guests
+        console.log("[AuthProvider] User is not logged in (Session check completed)");
+      } else {
+        console.error("[AuthProvider] getMe failed:", e);
+      }
       setUser(null);
     } finally {
       console.log("[AuthProvider] refreshUser finally. Setting isLoading false.");
