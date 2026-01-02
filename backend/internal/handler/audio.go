@@ -79,6 +79,18 @@ func (h *AudioHandler) HandleWebSocket(c *websocket.Conn) {
 		log.Printf("👤 [%s] Participant ID: %s", sess.ID, participantId)
 	}
 
+	// Room ID 추출 (Locals에서)
+	if roomId, ok := c.Locals("roomId").(string); ok && roomId != "" {
+		sess.SetRoomID(roomId)
+		log.Printf("🏠 [%s] Room ID: %s", sess.ID, roomId)
+	}
+
+	// Listener ID 추출 (Locals에서)
+	if listenerId, ok := c.Locals("listenerId").(string); ok && listenerId != "" {
+		sess.SetListenerID(listenerId)
+		log.Printf("👂 [%s] Listener ID: %s", sess.ID, listenerId)
+	}
+
 	log.Printf("🔗 [%s] New WebSocket connection established", sess.ID)
 
 	// Graceful Shutdown & Resource Cleanup
@@ -330,7 +342,12 @@ func (h *AudioHandler) aiUnifiedWorker(sess *session.Session) {
 	}
 
 	// 단일 gRPC 스트림 시작 (SessionConfig 전달)
-	roomID := sess.ID // TODO: 실제 room ID 사용
+	roomID := sess.GetRoomID()
+	if roomID == "" {
+		roomID = sess.ID // 방 ID가 없으면 세션 ID 사용
+	}
+	listenerId := sess.GetListenerID()
+	log.Printf("🏠 [%s] Starting AI stream with roomId=%s, listenerId=%s", sess.ID, roomID, listenerId)
 	chatStream, err := h.aiClient.StartChatStream(sess.Context(), sess.ID, roomID, config)
 	if err != nil {
 		log.Printf("❌ [%s] Failed to start AI stream: %v", sess.ID, err)

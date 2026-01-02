@@ -318,6 +318,14 @@ func (s *Server) SetupRoutes() {
 		participantId := c.Query("participantId", "")
 		c.Locals("participantId", participantId)
 
+		// Room ID 추출 (같은 방의 동일 언어 그룹을 묶기 위해)
+		roomId := c.Query("roomId", "")
+		c.Locals("roomId", roomId)
+
+		// Listener ID 추출 (듣는 사람의 identity)
+		listenerId := c.Query("listenerId", "")
+		c.Locals("listenerId", listenerId)
+
 		return c.Next()
 	}, websocket.New(s.handler.HandleWebSocket, websocket.Config{
 		ReadBufferSize:  s.cfg.WebSocket.ReadBufferSize,

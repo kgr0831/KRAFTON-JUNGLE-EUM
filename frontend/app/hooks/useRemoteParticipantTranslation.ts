@@ -27,10 +27,12 @@ export interface RemoteTranscriptData extends TranscriptData {
 }
 
 interface UseRemoteParticipantTranslationOptions {
+    roomId: string;                // Room ID for grouping
     enabled: boolean;              // TTS 재생 여부 (번역 모드)
     sttEnabled?: boolean;          // STT 항상 활성화 여부 (기본: true)
     sourceLanguage?: TargetLanguage;  // 발화자가 말하는 언어 (기본: 'ko')
     targetLanguage?: TargetLanguage;  // 듣고 싶은 언어 (번역 대상)
+    listenerId?: string;           // 리스너 ID (로컬 사용자)
     autoPlayTTS?: boolean;
     onTranscript?: (data: RemoteTranscriptData) => void;
     onError?: (error: Error) => void;
@@ -144,10 +146,12 @@ function resample(inputBuffer: Float32Array, inputSampleRate: number, outputSamp
 }
 
 export function useRemoteParticipantTranslation({
+    roomId,
     enabled,
     sttEnabled = true,  // STT는 기본적으로 항상 활성화
     sourceLanguage = 'ko',  // 발화자가 말하는 언어 (기본: 한국어)
     targetLanguage = 'en',  // 듣고 싶은 언어 (기본: 영어)
+    listenerId,
     autoPlayTTS = true,
     onTranscript,
     onError,
@@ -168,6 +172,8 @@ export function useRemoteParticipantTranslation({
     const creatingStreamsRef = useRef<Set<string>>(new Set());  // 중복 생성 방지용 락
     const enabledRef = useRef(enabled);
     const sttEnabledRef = useRef(sttEnabled);
+    const roomIdRef = useRef(roomId);
+    const listenerIdRef = useRef(listenerId);
     const sourceLanguageRef = useRef(sourceLanguage);
     const targetLanguageRef = useRef(targetLanguage);
     const autoPlayTTSRef = useRef(autoPlayTTS);
@@ -207,6 +213,8 @@ export function useRemoteParticipantTranslation({
     useEffect(() => {
         enabledRef.current = enabled;
         sttEnabledRef.current = sttEnabled;
+        roomIdRef.current = roomId;
+        listenerIdRef.current = listenerId;
         sourceLanguageRef.current = sourceLanguage;
         targetLanguageRef.current = targetLanguage;
         autoPlayTTSRef.current = autoPlayTTS;
@@ -217,7 +225,7 @@ export function useRemoteParticipantTranslation({
         unduckAllRef.current = unduckAll;
         queueAudioRef.current = queueAudio;
         stopAllAudioRef.current = stopAllAudio;
-    }, [enabled, sttEnabled, sourceLanguage, targetLanguage, autoPlayTTS, onTranscript, onError, duckParticipant, unduckParticipant, unduckAll, queueAudio, stopAllAudio]);
+    }, [enabled, sttEnabled, roomId, listenerId, sourceLanguage, targetLanguage, autoPlayTTS, onTranscript, onError, duckParticipant, unduckParticipant, unduckAll, queueAudio, stopAllAudio]);
 
     // Update local participant identity ref
     useEffect(() => {
@@ -578,10 +586,13 @@ export function useRemoteParticipantTranslation({
                 participantMetadata: participant.metadata,
             });
 
-            // Create WebSocket with participantId and language params
+            // Create WebSocket with roomId, listenerId, participantId and language params
+            // roomId = 방 ID (같은 방의 동일 언어 그룹을 묶기 위해)
+            // listenerId = 듣는 사람의 ID (로컬 사용자)
             // sourceLang = 원격 참가자가 말하는 언어 (그들의 메타데이터에서)
             // targetLang = 내가 듣고 싶은 언어 (번역 대상)
-            const wsUrl = `${WS_BASE_URL}?sourceLang=${remoteSourceLang}&targetLang=${targetLanguageRef.current}&participantId=${encodeURIComponent(participantId)}`;
+            const actualListenerId = listenerIdRef.current || localParticipantIdRef.current || 'unknown';
+            const wsUrl = `${WS_BASE_URL}?roomId=${encodeURIComponent(roomIdRef.current)}&listenerId=${encodeURIComponent(actualListenerId)}&sourceLang=${remoteSourceLang}&targetLang=${targetLanguageRef.current}&participantId=${encodeURIComponent(participantId)}`;
             const ws = new WebSocket(wsUrl);
             ws.binaryType = 'arraybuffer';
 

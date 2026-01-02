@@ -189,10 +189,12 @@ function VideoCallContent({
     const {
         isActive: isTranslationActive,
     } = useRemoteParticipantTranslation({
+        roomId,                      // 방 ID (같은 방의 동일 언어 그룹을 묶기 위해)
         enabled: isTranslationOpen,  // TTS 재생 여부 (번역 모드)
         sttEnabled: true,            // STT는 항상 활성화
         sourceLanguage,              // 발화자가 말하는 언어
         targetLanguage,              // 듣고 싶은 언어
+        listenerId: localParticipant?.identity,  // 리스너 ID
         autoPlayTTS: true,
         onTranscript: handleTranscript,
     });

@@ -315,6 +315,251 @@ class Config:
 
     MIN_TTS_TEXT_LENGTH = 2
 
+    # Room Cache Settings
+    CACHE_TTL_SECONDS = 10  # 캐시 유효 시간 (10초)
+    CACHE_CLEANUP_INTERVAL = 30  # 캐시 정리 간격 (30초)
+
+
+# =============================================================================
+# Room-based Cache Manager - STT/Translation/TTS 결과 캐싱
+# =============================================================================
+
+@dataclass
+class CacheEntry:
+    """캐시 엔트리"""
+    value: any
+    created_at: float
+    ttl: float = Config.CACHE_TTL_SECONDS
+
+    def is_expired(self) -> bool:
+        return time.time() - self.created_at > self.ttl
+
+
+class RoomCacheManager:
+    """
+    Room 기반 캐시 매니저
+
+    동일 Room 내에서 동일한 발화에 대해:
+    - STT 결과: 1회만 처리
+    - 번역 결과: 타겟 언어별 1회만 처리
+    - TTS 결과: 타겟 언어별 1회만 처리
+
+    이를 통해 같은 언어를 원하는 여러 리스너가 동일한 결과를 공유
+    """
+    _instance = None
+    _lock = threading.Lock()
+
+    def __new__(cls):
+        if cls._instance is None:
+            with cls._lock:
+                if cls._instance is None:
+                    cls._instance = super().__new__(cls)
+                    cls._instance._initialized = False
+        return cls._instance
+
+    def initialize(self):
+        if self._initialized:
+            return
+
+        # room_id -> speaker_id -> cache_key -> CacheEntry
+        self.stt_cache: Dict[str, Dict[str, Dict[str, CacheEntry]]] = defaultdict(lambda: defaultdict(dict))
+        self.translation_cache: Dict[str, Dict[str, CacheEntry]] = defaultdict(dict)  # cache_key -> CacheEntry
+        self.tts_cache: Dict[str, Dict[str, CacheEntry]] = defaultdict(dict)  # cache_key -> CacheEntry
+
+        # 리스너 관리: room_id -> target_lang -> set of listener_ids
+        self.room_listeners: Dict[str, Dict[str, Set[str]]] = defaultdict(lambda: defaultdict(set))
+
+        # 결과 대기 큐: 동일 요청이 처리 중일 때 대기
+        self.pending_requests: Dict[str, threading.Event] = {}
+
+        self._cache_lock = threading.Lock()
+        self._initialized = True
+
+        # 주기적 캐시 정리 스레드 시작
+        self._cleanup_thread = threading.Thread(target=self._cleanup_loop, daemon=True)
+        self._cleanup_thread.start()
+
+        DebugLogger.log("CACHE", "RoomCacheManager initialized")
+
+    def _cleanup_loop(self):
+        """주기적으로 만료된 캐시 정리"""
+        while True:
+            time.sleep(Config.CACHE_CLEANUP_INTERVAL)
+            self._cleanup_expired()
+
+    def _cleanup_expired(self):
+        """만료된 캐시 엔트리 제거"""
+        with self._cache_lock:
+            now = time.time()
+            cleaned = 0
+
+            # STT 캐시 정리
+            for room_id in list(self.stt_cache.keys()):
+                for speaker_id in list(self.stt_cache[room_id].keys()):
+                    for key in list(self.stt_cache[room_id][speaker_id].keys()):
+                        if self.stt_cache[room_id][speaker_id][key].is_expired():
+                            del self.stt_cache[room_id][speaker_id][key]
+                            cleaned += 1
+
+            # Translation 캐시 정리
+            for key in list(self.translation_cache.keys()):
+                if self.translation_cache[key].is_expired():
+                    del self.translation_cache[key]
+                    cleaned += 1
+
+            # TTS 캐시 정리
+            for key in list(self.tts_cache.keys()):
+                if self.tts_cache[key].is_expired():
+                    del self.tts_cache[key]
+                    cleaned += 1
+
+            if cleaned > 0:
+                DebugLogger.log("CACHE_CLEANUP", f"Cleaned {cleaned} expired entries")
+
+    def register_listener(self, room_id: str, listener_id: str, target_lang: str):
+        """리스너 등록"""
+        with self._cache_lock:
+            self.room_listeners[room_id][target_lang].add(listener_id)
+            DebugLogger.log("CACHE", f"Listener registered", {
+                "room": room_id[:8] if room_id else "unknown",
+                "listener": listener_id[:8] if listener_id else "unknown",
+                "target_lang": target_lang,
+                "total_listeners": len(self.room_listeners[room_id][target_lang])
+            })
+
+    def unregister_listener(self, room_id: str, listener_id: str, target_lang: str):
+        """리스너 해제"""
+        with self._cache_lock:
+            if room_id in self.room_listeners and target_lang in self.room_listeners[room_id]:
+                self.room_listeners[room_id][target_lang].discard(listener_id)
+
+    def get_listeners_for_language(self, room_id: str, target_lang: str) -> Set[str]:
+        """특정 타겟 언어의 모든 리스너 ID 반환"""
+        with self._cache_lock:
+            return self.room_listeners[room_id][target_lang].copy()
+
+    def _make_audio_hash(self, audio_bytes: bytes) -> str:
+        """오디오 데이터의 해시 생성 (빠른 비교용)"""
+        import hashlib
+        return hashlib.md5(audio_bytes).hexdigest()[:16]
+
+    def get_or_create_stt(self, room_id: str, speaker_id: str, audio_bytes: bytes,
+                          transcribe_fn) -> Tuple[str, float, bool]:
+        """
+        STT 결과 캐시에서 가져오거나 새로 생성
+
+        Returns:
+            (text, confidence, was_cached)
+        """
+        audio_hash = self._make_audio_hash(audio_bytes)
+        cache_key = f"{room_id}:{speaker_id}:{audio_hash}"
+
+        event = None
+        with self._cache_lock:
+            # 캐시 확인
+            if room_id in self.stt_cache and speaker_id in self.stt_cache[room_id]:
+                if audio_hash in self.stt_cache[room_id][speaker_id]:
+                    entry = self.stt_cache[room_id][speaker_id][audio_hash]
+                    if not entry.is_expired():
+                        DebugLogger.log("CACHE_HIT", "STT cache hit", {"key": cache_key[:16]})
+                        return entry.value[0], entry.value[1], True
+
+            # 처리 중인지 확인
+            if cache_key in self.pending_requests:
+                event = self.pending_requests[cache_key]
+
+        # 다른 스레드가 처리 중이면 대기
+        if event is not None:
+            event.wait(timeout=Config.STT_TIMEOUT)
+            with self._cache_lock:
+                if room_id in self.stt_cache and speaker_id in self.stt_cache[room_id]:
+                    if audio_hash in self.stt_cache[room_id][speaker_id]:
+                        entry = self.stt_cache[room_id][speaker_id][audio_hash]
+                        return entry.value[0], entry.value[1], True
+
+        # 처리 시작 마킹
+        with self._cache_lock:
+            self.pending_requests[cache_key] = threading.Event()
+
+        try:
+            # 실제 STT 처리
+            text, confidence = transcribe_fn(audio_bytes)
+
+            # 결과 캐시
+            with self._cache_lock:
+                self.stt_cache[room_id][speaker_id][audio_hash] = CacheEntry(
+                    value=(text, confidence),
+                    created_at=time.time()
+                )
+                DebugLogger.log("CACHE_SET", "STT cached", {"key": cache_key[:16], "text_len": len(text)})
+
+            return text, confidence, False
+        finally:
+            with self._cache_lock:
+                if cache_key in self.pending_requests:
+                    self.pending_requests[cache_key].set()
+                    del self.pending_requests[cache_key]
+
+    def get_or_create_translation(self, text: str, source_lang: str, target_lang: str,
+                                   translate_fn) -> Tuple[str, bool]:
+        """
+        번역 결과 캐시에서 가져오거나 새로 생성
+
+        Returns:
+            (translated_text, was_cached)
+        """
+        cache_key = f"{source_lang}:{target_lang}:{hash(text)}"
+
+        with self._cache_lock:
+            if cache_key in self.translation_cache:
+                entry = self.translation_cache[cache_key]
+                if not entry.is_expired():
+                    DebugLogger.log("CACHE_HIT", "Translation cache hit", {"key": cache_key[:24]})
+                    return entry.value, True
+
+        # 실제 번역 처리
+        translated = translate_fn(text, source_lang, target_lang)
+
+        # 결과 캐시
+        with self._cache_lock:
+            self.translation_cache[cache_key] = CacheEntry(
+                value=translated,
+                created_at=time.time()
+            )
+            DebugLogger.log("CACHE_SET", "Translation cached", {"key": cache_key[:24]})
+
+        return translated, False
+
+    def get_or_create_tts(self, text: str, target_lang: str,
+                          synthesize_fn) -> Tuple[bytes, int, bool]:
+        """
+        TTS 결과 캐시에서 가져오거나 새로 생성
+
+        Returns:
+            (audio_bytes, duration_ms, was_cached)
+        """
+        cache_key = f"tts:{target_lang}:{hash(text)}"
+
+        with self._cache_lock:
+            if cache_key in self.tts_cache:
+                entry = self.tts_cache[cache_key]
+                if not entry.is_expired():
+                    DebugLogger.log("CACHE_HIT", "TTS cache hit", {"key": cache_key[:24]})
+                    return entry.value[0], entry.value[1], True
+
+        # 실제 TTS 처리
+        audio_bytes, duration_ms = synthesize_fn(text, target_lang)
+
+        # 결과 캐시
+        with self._cache_lock:
+            self.tts_cache[cache_key] = CacheEntry(
+                value=(audio_bytes, duration_ms),
+                created_at=time.time()
+            )
+            DebugLogger.log("CACHE_SET", "TTS cached", {"key": cache_key[:24]})
+
+        return audio_bytes, duration_ms, False
+
 
 # =============================================================================
 # Language Topology - 언어 어순 기반 버퍼링 전략
@@ -586,11 +831,13 @@ class ModelManager:
         print("Loading AI Models (v10)")
         print("=" * 70)
 
-        # 0. Async Loop Manager (for Amazon Transcribe)
-        print("[0/4] Initializing Async Loop Manager...")
+        # 0. Async Loop Manager (for Amazon Transcribe) + Room Cache Manager
+        print("[0/5] Initializing Async Loop Manager & Room Cache...")
         self.async_manager = AsyncLoopManager()
         self.async_manager.initialize()
-        print("      ✓ Async Loop Manager initialized")
+        self.room_cache = RoomCacheManager()
+        self.room_cache.initialize()
+        print("      ✓ Async Loop Manager & Room Cache initialized")
 
         # 1. STT Backend
         self.whisper_model = None
@@ -1337,15 +1584,27 @@ class ConversationServicer(conversation_pb2_grpc.ConversationServiceServicer):
         if is_final:
             state.sentences_completed += 1
 
-        # 오디오 정규화
-        audio_array = np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32) / 32768.0
-
-        # ===== STEP 1: STT =====
+        # ===== STEP 1: STT (with Room Cache) =====
         stt_start = time.time()
         source_lang = state.speaker.source_language
-        original_text, confidence = self.models.transcribe(audio_array, source_lang)
+
+        # 캐시를 활용한 STT
+        def do_transcribe(audio_data):
+            audio_arr = np.frombuffer(audio_data, dtype=np.int16).astype(np.float32) / 32768.0
+            return self.models.transcribe(audio_arr, source_lang)
+
+        original_text, confidence, stt_cached = self.models.room_cache.get_or_create_stt(
+            room_id=state.room_id,
+            speaker_id=state.speaker.participant_id,
+            audio_bytes=audio_bytes,
+            transcribe_fn=do_transcribe
+        )
+
         stt_latency = (time.time() - stt_start) * 1000
         state.total_stt_latency_ms += stt_latency
+
+        if stt_cached:
+            DebugLogger.log("CACHE_STT", f"Using cached STT result", {"text_preview": original_text[:30] if original_text else ""})
 
         if not original_text:
             DebugLogger.log("PIPELINE_SKIP", "No text from STT, skipping rest of pipeline")
@@ -1411,7 +1670,19 @@ class ConversationServicer(conversation_pb2_grpc.ConversationServiceServicer):
 
         trans_start = time.time()
         for target_lang in target_languages:
-            translated_text = self.models.translate(original_text, source_lang, target_lang)
+            # 캐시를 활용한 번역
+            def do_translate(text, src, tgt):
+                return self.models.translate(text, src, tgt)
+
+            translated_text, trans_cached = self.models.room_cache.get_or_create_translation(
+                text=original_text,
+                source_lang=source_lang,
+                target_lang=target_lang,
+                translate_fn=do_translate
+            )
+
+            if trans_cached:
+                DebugLogger.log("CACHE_TRANS", f"Using cached translation", {"target": target_lang})
 
             if translated_text:
                 target_participants = state.get_participants_by_target_language(target_lang)
@@ -1452,7 +1723,7 @@ class ConversationServicer(conversation_pb2_grpc.ConversationServiceServicer):
             )
         )
 
-        # ===== STEP 3: TTS =====
+        # ===== STEP 3: TTS (with Room Cache) =====
         tts_start = time.time()
         for translation in translations:
             target_lang = translation.target_language
@@ -1465,13 +1736,25 @@ class ConversationServicer(conversation_pb2_grpc.ConversationServiceServicer):
                translated_text.strip() in Config.FILLER_WORDS:
                 continue
 
-            audio_data, duration_ms = self.models.synthesize_speech(translated_text, target_lang)
+            # 캐시를 활용한 TTS
+            def do_synthesize(text, lang):
+                return self.models.synthesize_speech(text, lang)
+
+            audio_data, duration_ms, tts_cached = self.models.room_cache.get_or_create_tts(
+                text=translated_text,
+                target_lang=target_lang,
+                synthesize_fn=do_synthesize
+            )
+
+            if tts_cached:
+                DebugLogger.log("CACHE_TTS", f"Using cached TTS", {"target": target_lang, "audio_bytes": len(audio_data) if audio_data else 0})
 
             if audio_data:
                 DebugLogger.log("TTS_SEND", f"Sending TTS audio", {
                     "target_lang": target_lang,
                     "audio_bytes": len(audio_data),
-                    "duration_ms": duration_ms
+                    "duration_ms": duration_ms,
+                    "cached": tts_cached
                 })
 
                 yield conversation_pb2.ChatResponse(
