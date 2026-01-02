@@ -1,13 +1,13 @@
 """
-Python gRPC AI Server - v7 (Production)
+Python gRPC AI Server - v9 (Production)
 
 Features:
 - Adaptive Buffering based on Language Topology
 - Multi-user Target Language Support
 - VAD-based Sentence Detection
+- Amazon Transcribe Streaming (STT)
+- Qwen3-8B Translation (Alibaba)
 - Amazon Polly TTS
-- Faster-Whisper Large-v3 (CUDA)
-- NLLB-200-3.3B Translation (Meta's No Language Left Behind)
 """
 
 import sys
@@ -27,10 +27,14 @@ import grpc
 import numpy as np
 import torch
 import boto3
-from faster_whisper import WhisperModel
 
-# NLLB Translation Model
-from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
+# Amazon Transcribe Streaming
+from amazon_transcribe.client import TranscribeStreamingClient
+from amazon_transcribe.handlers import TranscriptResultStreamHandler
+from amazon_transcribe.model import TranscriptEvent
+
+# Qwen3 Translation Model
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from generated import conversation_pb2
@@ -59,28 +63,42 @@ class Config:
     SILENCE_DURATION_MS = 700    # 문장 끝 감지용 침묵 지속 시간
     SILENCE_FRAMES = int(SILENCE_DURATION_MS / 100)  # 100ms 프레임 기준
 
-    # Model settings
-    WHISPER_MODEL = os.getenv("WHISPER_MODEL", "large-v3")
-    WHISPER_DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-    WHISPER_COMPUTE_TYPE = "float16" if torch.cuda.is_available() else "int8"
+    # Amazon Transcribe Language Codes
+    TRANSCRIBE_LANG_CODES = {
+        "ko": "ko-KR",    # Korean
+        "en": "en-US",    # English (US)
+        "ja": "ja-JP",    # Japanese
+        "zh": "zh-CN",    # Chinese (Mandarin)
+        "es": "es-US",    # Spanish (US)
+        "fr": "fr-FR",    # French
+        "de": "de-DE",    # German
+        "pt": "pt-BR",    # Portuguese (Brazil)
+        "ru": "ru-RU",    # Russian
+        "ar": "ar-SA",    # Arabic (Saudi Arabia)
+        "hi": "hi-IN",    # Hindi
+        "tr": "tr-TR",    # Turkish
+    }
 
-    # NLLB Translation Model (Meta's No Language Left Behind)
-    NLLB_MODEL = os.getenv("NLLB_MODEL", "facebook/nllb-200-3.3B")
+    # Qwen3 Translation Model (Alibaba)
+    QWEN_MODEL = os.getenv("QWEN_MODEL", "Qwen/Qwen3-8B")
 
-    # NLLB Language Codes
-    NLLB_LANG_CODES = {
-        "ko": "kor_Hang",  # Korean
-        "en": "eng_Latn",  # English
-        "ja": "jpn_Jpan",  # Japanese
-        "zh": "zho_Hans",  # Chinese (Simplified)
-        "es": "spa_Latn",  # Spanish
-        "fr": "fra_Latn",  # French
-        "de": "deu_Latn",  # German
-        "pt": "por_Latn",  # Portuguese
-        "ru": "rus_Cyrl",  # Russian
-        "ar": "arb_Arab",  # Arabic
-        "hi": "hin_Deva",  # Hindi
-        "tr": "tur_Latn",  # Turkish
+    # GPU Device
+    GPU_DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+
+    # Language Names (for Qwen3 prompts)
+    LANGUAGE_NAMES = {
+        "ko": "Korean",
+        "en": "English",
+        "ja": "Japanese",
+        "zh": "Chinese",
+        "es": "Spanish",
+        "fr": "French",
+        "de": "German",
+        "pt": "Portuguese",
+        "ru": "Russian",
+        "ar": "Arabic",
+        "hi": "Hindi",
+        "tr": "Turkish",
     }
 
     # AWS Polly
@@ -303,25 +321,26 @@ class ModelManager:
         print("Loading AI Models...")
         print("=" * 60)
 
-        # STT: Faster-Whisper
-        print(f"[1/3] Loading Whisper {Config.WHISPER_MODEL}...")
-        print(f"      Device: {Config.WHISPER_DEVICE}, Compute: {Config.WHISPER_COMPUTE_TYPE}")
-        self.stt_model = WhisperModel(
-            Config.WHISPER_MODEL,
-            device=Config.WHISPER_DEVICE,
-            compute_type=Config.WHISPER_COMPUTE_TYPE
-        )
-        print("      ✓ Whisper loaded")
+        # STT: Amazon Transcribe Streaming
+        print("[1/3] Initializing Amazon Transcribe Streaming...")
+        self.transcribe_region = Config.AWS_REGION
+        print(f"      Region: {self.transcribe_region}")
+        print("      ✓ Amazon Transcribe initialized")
 
-        # Translation: NLLB-200 (Meta's No Language Left Behind)
-        print(f"[2/3] Loading NLLB {Config.NLLB_MODEL}...")
-        self.nllb_tokenizer = AutoTokenizer.from_pretrained(Config.NLLB_MODEL)
-        self.nllb_model = AutoModelForSeq2SeqLM.from_pretrained(
-            Config.NLLB_MODEL,
-            torch_dtype=torch.float16 if Config.WHISPER_DEVICE == "cuda" else torch.float32,
-            device_map="auto",
+        # Translation: Qwen3-8B (Alibaba)
+        print(f"[2/3] Loading Qwen3 {Config.QWEN_MODEL}...")
+        self.qwen_tokenizer = AutoTokenizer.from_pretrained(
+            Config.QWEN_MODEL,
+            trust_remote_code=True
         )
-        print("      ✓ NLLB loaded (~7GB VRAM)")
+        self.qwen_model = AutoModelForCausalLM.from_pretrained(
+            Config.QWEN_MODEL,
+            torch_dtype=torch.float16 if Config.GPU_DEVICE == "cuda" else torch.float32,
+            device_map="auto",
+            trust_remote_code=True,
+        )
+        self.qwen_model.eval()
+        print("      ✓ Qwen3-8B loaded (~16GB VRAM)")
 
         # TTS: Amazon Polly
         print("[3/3] Initializing Amazon Polly...")
@@ -336,7 +355,7 @@ class ModelManager:
 
     def transcribe(self, audio_data: np.ndarray, language: str) -> Tuple[str, float]:
         """
-        음성을 텍스트로 변환
+        음성을 텍스트로 변환 (Amazon Transcribe Streaming)
 
         Args:
             audio_data: float32 normalized audio array
@@ -346,48 +365,116 @@ class ModelManager:
             (text, confidence)
         """
         try:
-            segments, info = self.stt_model.transcribe(
-                audio_data,
-                language=language,
-                beam_size=5,
-                best_of=5,  # 더 많은 후보 탐색
-                patience=1.0,  # 더 인내심 있게 탐색
-                vad_filter=True,
-                vad_parameters={
-                    "min_silence_duration_ms": 300,  # 더 짧은 침묵도 허용
-                    "speech_pad_ms": 300,  # 음성 패딩 증가
-                    "threshold": 0.3,  # VAD 임계값 낮춤 (더 민감)
-                },
-                condition_on_previous_text=False,
-                no_speech_threshold=0.5,  # 음성 없음 임계값 낮춤
-            )
+            # ========== 디버그: 오디오 분석 ==========
+            audio_rms = np.sqrt(np.mean(audio_data ** 2))
+            audio_max = np.max(np.abs(audio_data))
+            audio_duration = len(audio_data) / Config.SAMPLE_RATE
 
-            text_parts = []
-            total_confidence = 0.0
-            segment_count = 0
+            print(f"[STT DEBUG] Audio: {len(audio_data)} samples ({audio_duration:.2f}s), "
+                  f"RMS={audio_rms:.4f}, Max={audio_max:.4f}")
 
-            for seg in segments:
-                text = seg.text.strip()
-                if text and text not in ["...", "…", "."]:
-                    text_parts.append(text)
-                    total_confidence += seg.avg_logprob
-                    segment_count += 1
-
-            if not text_parts:
+            # 완전 침묵만 스킵 (매우 낮은 임계값)
+            if audio_rms < 0.001:
+                print(f"[STT] Skipped (silence): RMS={audio_rms:.6f}")
                 return "", 0.0
 
-            full_text = " ".join(text_parts)
-            avg_confidence = np.exp(total_confidence / segment_count) if segment_count > 0 else 0.0
+            # Amazon Transcribe 언어 코드 변환
+            transcribe_lang = Config.TRANSCRIBE_LANG_CODES.get(language, "en-US")
+            print(f"[STT] Using Amazon Transcribe with language: {transcribe_lang}")
 
-            return full_text, float(avg_confidence)
+            # 오디오를 int16 bytes로 변환
+            audio_int16 = (audio_data * 32768).clip(-32768, 32767).astype(np.int16)
+            audio_bytes = audio_int16.tobytes()
+
+            # asyncio 이벤트 루프에서 스트리밍 전사 실행
+            result_text, confidence = asyncio.run(
+                self._transcribe_streaming(audio_bytes, transcribe_lang)
+            )
+
+            if result_text:
+                print(f"[STT] Final result: \"{result_text}\" (confidence={confidence:.2f})")
+            else:
+                print(f"[STT] No speech detected")
+
+            return result_text, confidence
 
         except Exception as e:
+            import traceback
             print(f"[STT Error] {e}")
+            print(f"[STT Error Traceback] {traceback.format_exc()}")
+            return "", 0.0
+
+    async def _transcribe_streaming(self, audio_bytes: bytes, language_code: str) -> Tuple[str, float]:
+        """
+        Amazon Transcribe Streaming을 사용한 음성 전사
+
+        Args:
+            audio_bytes: int16 PCM audio bytes
+            language_code: Amazon Transcribe 언어 코드 (예: "ko-KR", "en-US")
+
+        Returns:
+            (text, confidence)
+        """
+        client = TranscribeStreamingClient(region=self.transcribe_region)
+
+        # 전사 결과를 수집할 핸들러
+        class ResultHandler(TranscriptResultStreamHandler):
+            def __init__(self, stream):
+                super().__init__(stream)
+                self.transcripts: List[Tuple[str, float]] = []  # (text, confidence)
+
+            async def handle_transcript_event(self, event: TranscriptEvent):
+                results = event.transcript.results
+                for result in results:
+                    if not result.is_partial:  # 최종 결과만 처리
+                        for alt in result.alternatives:
+                            text = alt.transcript.strip()
+                            conf = alt.confidence if hasattr(alt, 'confidence') and alt.confidence else 0.95
+                            if text:
+                                self.transcripts.append((text, conf))
+                                print(f"[Transcribe] Final: \"{text}\" (conf={conf:.2f})")
+
+        try:
+            # 스트리밍 세션 시작
+            stream = await client.start_stream_transcription(
+                language_code=language_code,
+                media_sample_rate_hz=Config.SAMPLE_RATE,
+                media_encoding="pcm",
+            )
+
+            handler = ResultHandler(stream.output_stream)
+
+            # 오디오를 청크로 나누어 전송 (8KB 청크)
+            chunk_size = 8192
+            async def send_audio():
+                for i in range(0, len(audio_bytes), chunk_size):
+                    chunk = audio_bytes[i:i + chunk_size]
+                    await stream.input_stream.send_audio_event(audio_chunk=chunk)
+                await stream.input_stream.end_stream()
+
+            # 오디오 전송과 결과 수신을 동시에 처리
+            await asyncio.gather(
+                send_audio(),
+                handler.handle_events()
+            )
+
+            # 결과 조합
+            if handler.transcripts:
+                texts = [t[0] for t in handler.transcripts]
+                confidences = [t[1] for t in handler.transcripts]
+                full_text = " ".join(texts)
+                avg_confidence = sum(confidences) / len(confidences) if confidences else 0.0
+                return full_text, avg_confidence
+            else:
+                return "", 0.0
+
+        except Exception as e:
+            print(f"[Transcribe Error] {e}")
             return "", 0.0
 
     def translate(self, text: str, source_lang: str, target_lang: str) -> str:
         """
-        텍스트 번역 (NLLB-200)
+        텍스트 번역 (Qwen3-8B)
 
         Args:
             text: 원본 텍스트
@@ -400,47 +487,86 @@ class ModelManager:
         if not text.strip():
             return ""
 
-        # NLLB 언어 코드로 변환
-        source_nllb = Config.NLLB_LANG_CODES.get(source_lang, "eng_Latn")
-        target_nllb = Config.NLLB_LANG_CODES.get(target_lang, "eng_Latn")
-
         # 같은 언어면 번역 불필요
         if source_lang == target_lang:
             return text
 
+        # 언어 이름 가져오기
+        source_name = Config.LANGUAGE_NAMES.get(source_lang, "English")
+        target_name = Config.LANGUAGE_NAMES.get(target_lang, "English")
+
         try:
-            # 소스 언어 설정
-            self.nllb_tokenizer.src_lang = source_nllb
+            # 번역 프롬프트 구성 (간결하고 직접적)
+            prompt = f"Translate the following {source_name} text to {target_name}. Output only the translation, nothing else.\n\n{text}"
+
+            # Qwen3 chat 형식으로 메시지 구성
+            messages = [
+                {"role": "user", "content": prompt}
+            ]
 
             # 토크나이즈
-            inputs = self.nllb_tokenizer(
-                text,
+            input_text = self.qwen_tokenizer.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=True,
+                enable_thinking=False  # 번역은 thinking 불필요
+            )
+            inputs = self.qwen_tokenizer(
+                input_text,
                 return_tensors="pt",
-                padding=True,
                 truncation=True,
                 max_length=512
-            ).to(self.nllb_model.device)
-
-            # 타겟 언어 토큰 ID
-            forced_bos_token_id = self.nllb_tokenizer.convert_tokens_to_ids(target_nllb)
+            ).to(self.qwen_model.device)
 
             # 번역 생성
             with torch.no_grad():
-                outputs = self.nllb_model.generate(
+                outputs = self.qwen_model.generate(
                     **inputs,
-                    forced_bos_token_id=forced_bos_token_id,
                     max_new_tokens=256,
-                    num_beams=5,
-                    early_stopping=True,
+                    do_sample=False,  # 결정적 출력
+                    temperature=None,
+                    top_p=None,
+                    pad_token_id=self.qwen_tokenizer.eos_token_id,
                 )
 
-            # 디코딩
-            result = self.nllb_tokenizer.decode(outputs[0], skip_special_tokens=True)
-            return result.strip()
+            # 디코딩 (입력 부분 제외)
+            input_len = inputs["input_ids"].shape[1]
+            result = self.qwen_tokenizer.decode(
+                outputs[0][input_len:],
+                skip_special_tokens=True
+            ).strip()
+
+            # 결과 정제 (불필요한 접두어 제거)
+            result = self._clean_translation(result)
+
+            print(f"[Translation] {source_lang}→{target_lang}: \"{text}\" → \"{result}\"")
+            return result
 
         except Exception as e:
+            import traceback
             print(f"[Translation Error] {e}")
+            print(f"[Translation Traceback] {traceback.format_exc()}")
             return ""
+
+    def _clean_translation(self, text: str) -> str:
+        """번역 결과에서 불필요한 접두어 제거"""
+        # 흔한 접두어 패턴 제거
+        prefixes = [
+            "Here is the translation:",
+            "Here's the translation:",
+            "Translation:",
+            "The translation is:",
+            "Translated text:",
+        ]
+        result = text.strip()
+        for prefix in prefixes:
+            if result.lower().startswith(prefix.lower()):
+                result = result[len(prefix):].strip()
+        # 따옴표 제거
+        if (result.startswith('"') and result.endswith('"')) or \
+           (result.startswith("'") and result.endswith("'")):
+            result = result[1:-1]
+        return result.strip()
 
     def synthesize_speech(self, text: str, target_lang: str) -> Tuple[bytes, int]:
         """
@@ -819,16 +945,17 @@ def serve():
     server.add_insecure_port(f'0.0.0.0:{Config.GRPC_PORT}')
     server.start()
 
-    nllb_name = Config.NLLB_MODEL.split('/')[-1]
+    qwen_name = Config.QWEN_MODEL.split('/')[-1]
     print(f"""
 ╔══════════════════════════════════════════════════════════════╗
-║  Python AI Server v7                                         ║
+║  Python AI Server v9                                         ║
 ╠══════════════════════════════════════════════════════════════╣
 ║  gRPC Port:     {Config.GRPC_PORT}                                        ║
-║  Device:        {Config.WHISPER_DEVICE.upper()}                                       ║
+║  Region:        {Config.AWS_REGION}                              ║
+║  Device:        {Config.GPU_DEVICE.upper()}                                       ║
 ╠══════════════════════════════════════════════════════════════╣
-║  STT:           Whisper {Config.WHISPER_MODEL}                            ║
-║  Translation:   {nllb_name}                              ║
+║  STT:           Amazon Transcribe Streaming                  ║
+║  Translation:   {qwen_name}                                   ║
 ║  TTS:           Amazon Polly                                 ║
 ╠══════════════════════════════════════════════════════════════╣
 ║  Buffering Strategies:                                       ║
