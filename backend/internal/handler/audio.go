@@ -9,7 +9,7 @@ import (
 
 	"github.com/gofiber/contrib/websocket"
 
-	"realtime-backend/internal/ai"
+	awsservice "realtime-backend/internal/aws"
 	"realtime-backend/internal/config"
 	"realtime-backend/internal/model"
 	"realtime-backend/internal/session"
@@ -17,25 +17,25 @@ import (
 
 // AudioHandler 오디오 WebSocket 핸들러
 type AudioHandler struct {
-	cfg      *config.Config
-	aiClient *ai.GrpcClient
+	cfg        *config.Config
+	awsService *awsservice.Service
 }
 
 // NewAudioHandler AudioHandler 생성자
 func NewAudioHandler(cfg *config.Config) *AudioHandler {
 	handler := &AudioHandler{cfg: cfg}
 
-	// AI 서버 연결 (활성화된 경우)
+	// AWS 서비스 초기화 (AI 활성화된 경우)
 	if cfg.AI.Enabled {
-		client, err := ai.NewGrpcClient(cfg.AI.ServerAddr)
+		service, err := awsservice.NewService(&cfg.S3)
 		if err != nil {
-			log.Printf("⚠️ Failed to connect to AI server: %v (running in echo mode)", err)
+			log.Printf("⚠️ Failed to initialize AWS service: %v (running in echo mode)", err)
 		} else {
-			handler.aiClient = client
-			log.Printf("🤖 Connected to AI server at %s", cfg.AI.ServerAddr)
+			handler.awsService = service
+			log.Printf("🤖 AWS service initialized (region: %s)", cfg.S3.Region)
 		}
 	} else {
-		log.Println("ℹ️ AI server disabled, running in echo mode")
+		log.Println("ℹ️ AI service disabled, running in echo mode")
 	}
 
 	return handler
@@ -43,9 +43,7 @@ func NewAudioHandler(cfg *config.Config) *AudioHandler {
 
 // Close 핸들러 리소스 정리
 func (h *AudioHandler) Close() error {
-	if h.aiClient != nil {
-		return h.aiClient.Close()
-	}
+	// AWS 서비스는 stateless이므로 특별한 종료 처리 불필요
 	return nil
 }
 
@@ -104,15 +102,15 @@ func (h *AudioHandler) HandleWebSocket(c *websocket.Conn) {
 	var wg sync.WaitGroup
 	var writeMu sync.Mutex // WebSocket 쓰기 동기화
 
-	// AI 모드 또는 에코 모드 선택 (핸드셰이크 완료 후)
-	if h.aiClient != nil {
-		// AI 모드: 단일 gRPC 스트림으로 통합
+	// AWS 모드 또는 에코 모드 선택 (핸드셰이크 완료 후)
+	if h.awsService != nil {
+		// AWS 모드: 직접 AWS 서비스 호출
 		wg.Add(3)
 
-		// 1. AI 통합 워커 (오디오 송신 + 응답 수신)
+		// 1. AWS 통합 워커 (오디오 송신 + 응답 수신)
 		go func() {
 			defer wg.Done()
-			h.aiUnifiedWorker(sess)
+			h.awsUnifiedWorker(sess)
 		}()
 
 		// 2. AI 응답 → WebSocket 전송 (오디오)
@@ -197,8 +195,8 @@ func (h *AudioHandler) performHandshake(c *websocket.Conn, sess *session.Session
 }
 
 func (h *AudioHandler) getMode() string {
-	if h.aiClient != nil {
-		return "ai"
+	if h.awsService != nil {
+		return "aws"
 	}
 	return "echo"
 }
@@ -257,72 +255,36 @@ func (h *AudioHandler) receiveLoop(c *websocket.Conn, sess *session.Session) {
 }
 
 // ============================================================================
-// AI 모드 워커들
+// AWS 모드 워커들
 // ============================================================================
 
-// aiUnifiedWorker 단일 gRPC 스트림으로 오디오 송수신 통합 처리
-func (h *AudioHandler) aiUnifiedWorker(sess *session.Session) {
-	log.Printf("🤖 [%s] AI unified worker started", sess.ID)
-	defer log.Printf("🤖 [%s] AI unified worker stopped", sess.ID)
+// awsUnifiedWorker AWS 서비스를 직접 사용하여 오디오 송수신 통합 처리
+func (h *AudioHandler) awsUnifiedWorker(sess *session.Session) {
+	log.Printf("🤖 [%s] AWS unified worker started", sess.ID)
+	defer log.Printf("🤖 [%s] AWS unified worker stopped", sess.ID)
 
 	// 세션 설정 정보 구성
 	metadata := sess.GetMetadata()
-	participantID := sess.GetParticipantID()
 	sourceLang := sess.GetSourceLanguage() // 발화자가 말하는 언어
 	targetLang := sess.GetLanguage()       // 듣고 싶은 언어
 
 	log.Printf("🌐 [%s] Language config: source=%s, target=%s", sess.ID, sourceLang, targetLang)
 
-	// 발화자 설정 - 발화자가 말하는 언어 사용
-	speaker := &ai.SpeakerConfig{
-		ParticipantID:  participantID,
-		Nickname:       participantID, // TODO: 실제 닉네임 가져오기
-		SourceLanguage: sourceLang,    // 발화자가 말하는 언어
-	}
-
-	// 참가자 설정 - 듣는 사람의 타겟 언어 사용
-	// TODO: 실제 참가자 목록 가져오기 (현재는 자기 자신만)
-	participants := []ai.ParticipantConfig{
-		{
-			ParticipantID:      participantID,
-			Nickname:           participantID,
-			TargetLanguage:     targetLang, // 듣고 싶은 언어
-			TranslationEnabled: sourceLang != targetLang, // 소스와 타겟이 다르면 번역 활성화
-		},
-	}
-
-	var config *ai.SessionConfig
+	// 샘플레이트 결정
+	var sampleRate int32 = 16000
 	if metadata != nil {
-		config = &ai.SessionConfig{
-			SampleRate:     metadata.SampleRate,
-			Channels:       uint32(metadata.Channels),
-			BitsPerSample:  uint32(metadata.BitsPerSample),
-			SourceLanguage: sourceLang, // 발화자가 말하는 언어
-			Participants:   participants,
-			Speaker:        speaker,
-		}
-	} else {
-		// 메타데이터가 없는 경우 기본값 사용
-		config = &ai.SessionConfig{
-			SampleRate:     16000,
-			Channels:       1,
-			BitsPerSample:  16,
-			SourceLanguage: sourceLang, // 발화자가 말하는 언어
-			Participants:   participants,
-			Speaker:        speaker,
-		}
+		sampleRate = int32(metadata.SampleRate)
 	}
 
-	// 단일 gRPC 스트림 시작 (SessionConfig 전달)
-	roomID := sess.ID // TODO: 실제 room ID 사용
-	chatStream, err := h.aiClient.StartChatStream(sess.Context(), sess.ID, roomID, config)
+	// AWS 번역 스트림 시작
+	translationStream, err := h.awsService.StartTranslationStream(sess.Context(), sess.ID, sourceLang, targetLang, sampleRate)
 	if err != nil {
-		log.Printf("❌ [%s] Failed to start AI stream: %v", sess.ID, err)
+		log.Printf("❌ [%s] Failed to start AWS translation stream: %v", sess.ID, err)
 		return
 	}
-	defer chatStream.Cancel()
+	defer translationStream.Close()
 
-	// 송신 고루틴: AudioPackets → gRPC
+	// 송신 고루틴: AudioPackets → AWS Transcribe
 	go func() {
 		for {
 			select {
@@ -336,92 +298,76 @@ func (h *AudioHandler) aiUnifiedWorker(sess *session.Session) {
 				if metadata == nil {
 					continue
 				}
-				// gRPC로 전송 (Non-blocking)
-				select {
-				case chatStream.SendChan <- packet.Data:
-				default:
-					log.Printf("⚠️ [%s] gRPC send buffer full, dropping packet #%d", sess.ID, packet.SeqNum)
+				// AWS Transcribe로 전송
+				if err := translationStream.SendAudio(packet.Data); err != nil {
+					log.Printf("⚠️ [%s] AWS send error: %v", sess.ID, err)
 				}
 			}
 		}
 	}()
 
-	// 수신 루프: gRPC → 세션 채널들
+	// 수신 루프: AWS → 세션 채널들
 	for {
 		select {
 		case <-sess.Context().Done():
 			return
 
-		case transcript, ok := <-chatStream.TranscriptChan:
+		case result, ok := <-translationStream.TranscriptChan:
 			if !ok {
 				return
 			}
-			log.Printf("📝 [%s] AI Transcript received: %s (partial=%v, final=%v)",
-				sess.ID, transcript.OriginalText, transcript.IsPartial, transcript.IsFinal)
+			log.Printf("📝 [%s] AWS Transcript received: original=%s, translated=%s",
+				sess.ID, result.OriginalText, result.TranslatedText)
 
-			// Partial 결과는 무시 (또는 실시간 표시용으로 전송)
-			if transcript.IsPartial {
-				log.Printf("📝 [%s] Partial STT (ignored): %s", sess.ID, transcript.OriginalText)
-				continue
-			}
-
-			// 번역 결과 추출 (첫 번째 번역 사용)
-			var translatedText string
-			if len(transcript.Translations) > 0 {
-				translatedText = transcript.Translations[0].TranslatedText
-			}
-
-			// 원본과 번역이 같으면 번역 없음
-			if translatedText == transcript.OriginalText {
-				translatedText = ""
+			// 번역 결과 처리
+			translatedText := result.TranslatedText
+			if translatedText == result.OriginalText {
+				translatedText = "" // 같으면 번역 없음
 			}
 
 			transcriptMsg := &session.TranscriptMessage{
 				Type:          "transcript",
 				ParticipantID: sess.GetParticipantID(),
-				Text:          transcript.OriginalText,
-				Original:      transcript.OriginalText,
+				Text:          result.OriginalText,
+				Original:      result.OriginalText,
 				Translated:    translatedText,
-				Language:      transcript.OriginalLanguage,
-				IsFinal:       transcript.IsFinal,
+				Language:      result.SourceLanguage,
+				IsFinal:       result.IsFinal,
 			}
 
 			select {
 			case sess.TranscriptChan <- transcriptMsg:
 				if translatedText != "" {
 					log.Printf("📝 [%s] Transcript sent: original=%s, translated=%s",
-						sess.ID, transcript.OriginalText, translatedText)
+						sess.ID, result.OriginalText, translatedText)
 				} else {
-					log.Printf("📝 [%s] Transcript sent: %s", sess.ID, transcript.OriginalText)
+					log.Printf("📝 [%s] Transcript sent: %s", sess.ID, result.OriginalText)
 				}
 			default:
 				log.Printf("⚠️ [%s] Transcript buffer full, dropping message", sess.ID)
 			}
 
-		case audioMsg, ok := <-chatStream.AudioChan:
+		case ttsResult, ok := <-translationStream.AudioChan:
 			if !ok {
 				return
 			}
-			log.Printf("🔊 [%s] AI Audio received: lang=%s, speaker=%s, size=%d bytes",
-				sess.ID, audioMsg.TargetLanguage, audioMsg.SpeakerParticipantID, len(audioMsg.AudioData))
+			log.Printf("🔊 [%s] AWS TTS received: lang=%s, size=%d bytes",
+				sess.ID, ttsResult.TargetLanguage, len(ttsResult.AudioData))
 
-			// Self-mute는 프론트엔드에서 처리 (useRemoteParticipantTranslation.ts)
-			// 백엔드는 모든 TTS 오디오를 전송
-
-			// AI 응답 오디오 → 에코 채널 (Non-blocking)
+			// TTS 오디오 → 에코 채널 (Non-blocking)
 			select {
-			case sess.EchoPackets <- audioMsg.AudioData:
+			case sess.EchoPackets <- ttsResult.AudioData:
 				log.Printf("🔊 [%s] TTS audio sent to WebSocket", sess.ID)
 			default:
-				log.Printf("⚠️ [%s] Echo buffer full, dropping AI audio response", sess.ID)
+				log.Printf("⚠️ [%s] Echo buffer full, dropping TTS audio", sess.ID)
 			}
 
-		case err, ok := <-chatStream.ErrChan:
+		case err, ok := <-translationStream.ErrorChan:
 			if !ok {
 				return
 			}
 			if err != nil {
-				log.Printf("❌ [%s] AI stream error: %v", sess.ID, err)
+				log.Printf("❌ [%s] AWS stream error: %v", sess.ID, err)
 			}
 			return
 		}

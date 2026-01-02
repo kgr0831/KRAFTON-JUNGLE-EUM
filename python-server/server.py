@@ -56,13 +56,13 @@ class Config:
     CHUNK_DURATION_MS = 1500  # 1.5초 청크
     CHUNK_BYTES = int(BYTES_PER_SECOND * CHUNK_DURATION_MS / 1000)  # 48000 bytes
 
-    # 실시간 번역을 위해 최대 버퍼 시간을 1초로 제한 (압도적으로 빠르게)
-    SENTENCE_MAX_DURATION_MS = 1000  # 문장 최대 대기 시간 (1초)
-    SENTENCE_MAX_BYTES = int(BYTES_PER_SECOND * SENTENCE_MAX_DURATION_MS / 1000)  # 32000 bytes
+    # 실시간 번역: 문장 완성도 vs 속도 밸런스
+    SENTENCE_MAX_DURATION_MS = 2500  # 문장 최대 대기 시간 (2.5초 - 문장 완성을 위해)
+    SENTENCE_MAX_BYTES = int(BYTES_PER_SECOND * SENTENCE_MAX_DURATION_MS / 1000)  # 80000 bytes
 
-    # VAD settings - 더 빠른 응답을 위해 짧게
+    # VAD settings - 침묵 감지로 빠르게 전송
     SILENCE_THRESHOLD_RMS = 30  # RMS 침묵 임계값
-    SILENCE_DURATION_MS = 300   # 문장 끝 감지용 침묵 지속 시간 (300ms)
+    SILENCE_DURATION_MS = 350   # 문장 끝 감지용 침묵 지속 시간 (350ms)
     SILENCE_FRAMES = int(SILENCE_DURATION_MS / 100)  # 100ms 프레임 기준
 
     # Translation backend: "aws" (fast) or "qwen" (local LLM)

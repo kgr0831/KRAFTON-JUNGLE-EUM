@@ -10,15 +10,15 @@ import { useAudioDucking } from "./useAudioDucking";
 const WS_BASE_URL = process.env.NEXT_PUBLIC_VOICE_WS_URL || 'ws://localhost:8080/ws/audio';
 const SAMPLE_RATE = Number(process.env.NEXT_PUBLIC_AUDIO_SAMPLE_RATE) || 16000;
 
-// 실시간 번역 설정: 압도적으로 빠른 응답을 위해 최적화
+// 실시간 번역 설정: 문장 완성도 vs 속도 밸런스
 const MIN_SAMPLES_TO_SEND = 0;  // 모든 오디오 전송 (스킵 없음)
-const MAX_BUFFER_DURATION_MS = 2000;  // 최대 2초 버퍼 (더 짧게)
+const MAX_BUFFER_DURATION_MS = 5000;  // 최대 5초 버퍼 (안전장치)
 const MAX_BUFFER_SAMPLES = SAMPLE_RATE * (MAX_BUFFER_DURATION_MS / 1000);
-const SILENCE_THRESHOLD = 0.004;  // 침묵 감지 RMS 임계값 (더 민감하게)
-const SPEECH_THRESHOLD = 0.006;  // 발화 시작 감지 RMS 임계값 (더 낮게)
-const SILENCE_DURATION_MS = 300;  // 300ms 침묵 = 발화 종료 (더 빠르게)
-const FORCED_SEND_INTERVAL_MS = 1000;  // 1초마다 강제 전송 (실시간)
-const ANALYSIS_INTERVAL_MS = 30;  // 30ms마다 버퍼 분석 (더 자주)
+const SILENCE_THRESHOLD = 0.004;  // 침묵 감지 RMS 임계값 (민감하게)
+const SPEECH_THRESHOLD = 0.006;  // 발화 시작 감지 RMS 임계값
+const SILENCE_DURATION_MS = 350;  // 350ms 침묵 = 발화 종료 (침묵 감지로 빠르게)
+const FORCED_SEND_INTERVAL_MS = 2500;  // 2.5초마다 강제 전송 (문장 완성 대기)
+const ANALYSIS_INTERVAL_MS = 30;  // 30ms마다 버퍼 분석
 
 export interface RemoteTranscriptData extends TranscriptData {
     participantId: string;
@@ -509,10 +509,18 @@ export function useRemoteParticipantTranslation({
             // 원격 참가자의 sourceLanguage를 그들의 메타데이터에서 가져옴
             // fallback으로 현재 설정된 sourceLanguage 사용
             const remoteSourceLang = getParticipantSourceLanguage(participant, sourceLanguageRef.current);
+            const myTargetLang = targetLanguageRef.current;
+
+            // 같은 언어면 번역 불필요 - 스트림 생성하지 않음
+            if (remoteSourceLang === myTargetLang) {
+                console.log(`[RemoteTranslation] ⏭️ Skipping ${participantId}: same language (${remoteSourceLang} == ${myTargetLang})`);
+                creatingStreamsRef.current.delete(participantId);  // 락 해제
+                return;
+            }
 
             console.log(`[RemoteTranslation] Creating stream for ${participantId}`, {
                 remoteSourceLang,  // 원격 참가자가 말하는 언어
-                myTargetLang: targetLanguageRef.current,  // 내가 듣고 싶은 언어
+                myTargetLang,  // 내가 듣고 싶은 언어
                 participantMetadata: participant.metadata,
             });
 
