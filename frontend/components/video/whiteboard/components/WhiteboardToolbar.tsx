@@ -120,7 +120,7 @@ function WhiteboardToolbarComponent({
                         {activeTool === 'pen' && (
                             <div className="flex items-center gap-3">
                                 <span className="text-xs font-bold text-stone-500 w-12 uppercase tracking-tight">
-                                    부드럽게
+                                    자연스럽게
                                 </span>
                                 <div className="flex-1 flex items-center gap-3">
                                     <input

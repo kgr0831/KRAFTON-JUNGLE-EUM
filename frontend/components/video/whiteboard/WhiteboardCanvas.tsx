@@ -8,16 +8,18 @@ import { apiClient } from '@/app/lib/api';
 
 import { DrawEvent, ClearEvent, RefetchEvent, CursorEvent, WhiteboardTool } from './types';
 import { ZOOM_SETTINGS, GRID_SETTINGS, TOOL_SETTINGS } from './constants';
-import { hexToNumber, generatePenCursor, generateEraserCursor, simplifyPoints, Point } from './utils';
+import { hexToNumber, generatePenCursor, generateEraserCursor, simplifyPoints, Point, getStrokePoints } from './utils';
 import { useWhiteboardCursors } from './hooks/useWhiteboardCursors';
 import { ZoomControls } from './components/ZoomControls';
 import { RemoteCursors, CursorVisual } from './components/RemoteCursors'; // Import CursorVisual
 import { WhiteboardToolbar } from './components/WhiteboardToolbar';
 
+import { OneEuroFilter } from './oneEuroFilter'; // Import Filter
+
 export default function WhiteboardCanvas() {
     // Refs
     const containerRef = useRef<HTMLDivElement>(null);
-    const localCursorRef = useRef<HTMLDivElement>(null); // Add ref
+    const localCursorRef = useRef<HTMLDivElement>(null);
     const appRef = useRef<PIXI.Application | null>(null);
     const drawingContainerRef = useRef<PIXI.Container | null>(null);
     const currentGraphicsRef = useRef<{
@@ -26,6 +28,13 @@ export default function WhiteboardCanvas() {
         width: number;
         isEraser: boolean;
     } | null>(null);
+
+    // Filters for Jitter Reduction (Phase 2)
+    // minCutoff=1.0 (Hz), beta=0.23 (Response Speed)
+    // TUNING: Aggressive Beta (0.05 -> 0.23) to ELIMINATE lag/squaring on fast circles.
+    // Normalized minCutoff (0.7 -> 1.0) for standard stationary stability.
+    const filterX = useRef(new OneEuroFilter(1.0, 0.23));
+    const filterY = useRef(new OneEuroFilter(1.0, 0.23));
 
     // Tool State
     const toolRef = useRef<WhiteboardTool>('pen');
@@ -71,8 +80,45 @@ export default function WhiteboardCanvas() {
         },
     });
 
-    // Drawing function
+    // Smoothing Helper: Quadratic Bezier Interpolation
+    const drawSmoothStroke = (graphics: PIXI.Graphics, points: { x: number, y: number }[], width: number, color: number) => {
+        if (points.length === 0) return;
+
+        graphics.setStrokeStyle({
+            width,
+            color,
+            alpha: 1,
+            cap: 'round',
+            join: 'round'
+        });
+
+        if (points.length < 3) {
+            graphics.moveTo(points[0].x, points[0].y);
+            for (let i = 1; i < points.length; i++) {
+                graphics.lineTo(points[i].x, points[i].y);
+            }
+        } else {
+            graphics.moveTo(points[0].x, points[0].y);
+            // Draw curves between midpoints
+            for (let i = 1; i < points.length - 1; i++) {
+                const p1 = points[i];
+                const p2 = points[i + 1];
+                const midX = (p1.x + p2.x) / 2;
+                const midY = (p1.y + p2.y) / 2;
+                graphics.quadraticCurveTo(p1.x, p1.y, midX, midY);
+            }
+            // Connect to last point
+            const last = points[points.length - 1];
+            graphics.lineTo(last.x, last.y);
+        }
+        graphics.stroke();
+    };
+
+    // Drawing function (Legacy/Remote wrapper)
     const drawLine = useCallback((x: number, y: number, prevX: number, prevY: number, color: number, width: number) => {
+        // NOTE: This single-segment (prev->curr) drawLine is only for legacy/remote stream fallback.
+        // It cannot smooth effectively because it only knows 2 points. 
+        // Real smoothing happens in onPointerMove (local) and loadHistory/batch (arrays).
         if (!drawingContainerRef.current) return;
 
         const isEraser = color === 0xffffff;
@@ -176,6 +222,14 @@ export default function WhiteboardCanvas() {
             isDrawing = true;
             setIsDrawing(true);
             const startPoint = getLocalPoint(e.clientX, e.clientY);
+
+            // Phase 2: Input Stabilization - Reset Filters
+            filterX.current.reset();
+            filterY.current.reset();
+            // Prime the filter with initial value
+            filterX.current.filter(startPoint.x, Date.now());
+            filterY.current.filter(startPoint.y, Date.now());
+
             prevRawPoint = startPoint;
             prevRenderedPoint = startPoint;
             currentStroke = [];
@@ -217,32 +271,46 @@ export default function WhiteboardCanvas() {
             if (!isDrawing || !prevRawPoint || !prevRenderedPoint) return;
 
             const rawPoint = getLocalPoint(e.clientX, e.clientY);
-            const sLevel = smoothnessRef.current;
 
-            const dist = Math.sqrt(
-                Math.pow(rawPoint.x - prevRawPoint.x, 2) +
-                Math.pow(rawPoint.y - prevRawPoint.y, 2)
-            );
+            // Phase 2: Input Stabilization (One Euro Filter)
+            // DYNAMIC TUNING based on "Natural" (sLevel: 0~10) slider
+            // RE-TUNED: Constrained range to prevent "Angularity/Squaring" at max level.
+            // 0 (Fast/Raw): beta=0.8, cutoff=1.5 (Almost raw input)
+            // 10 (Natural/Smooth): beta=0.1, cutoff=0.5 (Stabilized but responsive enough to avoid squares)
+            const sLevel = smoothnessRef.current; // 0 ~ 10
 
-            const distThresholdScreen = sLevel === 0 ? 0 : 0.5 + (sLevel * 0.5);
-            const threshold = distThresholdScreen / scaleRef.current;
+            // Linear Interpolation
+            // Beta: 0.8 -> 0.1
+            const newBeta = 0.8 - (sLevel / 10) * (0.8 - 0.1);
+            // Cutoff: 1.5 -> 0.5
+            const newCutoff = 1.5 - (sLevel / 10) * (1.5 - 0.5);
 
-            if (dist < threshold) return;
-
-            let targetPoint = rawPoint;
-            if (sLevel > 0) {
-                targetPoint = {
-                    x: (prevRawPoint.x + rawPoint.x) / 2,
-                    y: (prevRawPoint.y + rawPoint.y) / 2,
-                };
+            // Apply params
+            if (filterX.current && filterY.current) {
+                filterX.current.beta = newBeta;
+                filterX.current.minCutoff = newCutoff;
+                filterY.current.beta = newBeta;
+                filterY.current.minCutoff = newCutoff;
             }
+
+            const now = Date.now();
+            const stabilizedX = filterX.current.filter(rawPoint.x, now);
+            const stabilizedY = filterY.current.filter(rawPoint.y, now);
+
+            // Use stabilized point for rendering
+            const targetPoint = { x: stabilizedX, y: stabilizedY };
+
+            /* Legacy mid-point logic removed */
 
             const color = toolRef.current === 'eraser' ? 0xffffff : penColorRef.current;
             const baseSize = toolRef.current === 'eraser' ? eraserSizeRef.current : penSizeRef.current;
             const width = baseSize / scaleRef.current;
 
-            drawLine(targetPoint.x, targetPoint.y, prevRenderedPoint.x, prevRenderedPoint.y, color, width);
+            // **NEW: Polygon Rendering for Active Stroke**
+            if (!drawingContainerRef.current) return;
 
+            // 1. Add new point to stroke data
+            // We need to store the points to regenerate the polygon
             const event: DrawEvent = {
                 type: 'draw',
                 x: targetPoint.x,
@@ -252,13 +320,62 @@ export default function WhiteboardCanvas() {
                 color,
                 width,
             };
+            currentStroke.push(event);
 
+            // 2. Prepare Graphics
+            let graphics: PIXI.Graphics;
+            if (currentGraphicsRef.current) {
+                graphics = currentGraphicsRef.current.graphics;
+            } else {
+                graphics = new PIXI.Graphics();
+                if (toolRef.current === 'eraser') {
+                    graphics.blendMode = 'erase';
+                }
+                drawingContainerRef.current.addChild(graphics);
+                currentGraphicsRef.current = {
+                    graphics,
+                    color,
+                    width,
+                    isEraser: toolRef.current === 'eraser'
+                };
+            }
+
+            // 3. Clear and Redraw Polygon / Polyline
+            graphics.clear();
+
+            const isEraser = toolRef.current === 'eraser';
+
+            if (isEraser) {
+                // ERASER: Use Polyline (Simple Stroke) for stability
+                if (currentStroke.length > 0) {
+                    graphics.setStrokeStyle({
+                        width: width,
+                        color: color,
+                        alpha: 1,
+                        cap: 'round',
+                        join: 'round'
+                    });
+
+                    graphics.moveTo(currentStroke[0].x, currentStroke[0].y);
+                    for (let i = 1; i < currentStroke.length; i++) {
+                        graphics.lineTo(currentStroke[i].x, currentStroke[i].y);
+                    }
+                    graphics.stroke();
+                }
+            } else {
+                // Use Smooth Bezier Polyline
+                if (currentStroke.length > 0) {
+                    // Extract points
+                    const points = currentStroke.map(p => ({ x: p.x, y: p.y }));
+                    drawSmoothStroke(graphics, points, width, color);
+                }
+            }
+
+            // 4. Batching for Remote (Legacy Segment)
             if (room) {
-                // Batching: Push to buffer instead of sending immediately
                 pointBufferRef.current.push(event);
             }
 
-            currentStroke.push(event);
             prevRenderedPoint = targetPoint;
             prevRawPoint = rawPoint;
         };
@@ -279,7 +396,13 @@ export default function WhiteboardCanvas() {
 
             if (isDrawing && prevRawPoint && prevRenderedPoint) {
                 const finalRaw = getLocalPoint(e.clientX, e.clientY);
-                let dest = finalRaw;
+
+                // Phase 2: Stabilize final point
+                const now = Date.now();
+                const stabilizedX = filterX.current.filter(finalRaw.x, now);
+                const stabilizedY = filterY.current.filter(finalRaw.y, now);
+
+                let dest = { x: stabilizedX, y: stabilizedY };
 
                 // Handle single click (dot) - if no movement occurred, offset slightly to force render
                 if (currentStroke.length === 0 && dest.x === prevRenderedPoint.x && dest.y === prevRenderedPoint.y) {
@@ -327,7 +450,9 @@ export default function WhiteboardCanvas() {
                             { x: originalEvents[0].prevX, y: originalEvents[0].prevY },
                             ...originalEvents.map(e => ({ x: e.x, y: e.y }))
                         ];
-                        const tolerance = 1.0;
+                        // TUNING: Reduced tolerance from 0.1 to 0.01 (Virtually raw) to fix "Crumpled Curves"
+                        // We need more points for the Bezier smoothing to look natural.
+                        const tolerance = 0.01;
                         const simplifiedPoints = simplifyPoints(points, tolerance);
 
                         if (simplifiedPoints.length >= 2) {
@@ -347,7 +472,19 @@ export default function WhiteboardCanvas() {
                                 });
                             }
                             eventsToSend = newEvents;
-                            console.log(`[Whiteboard] Simplified: ${originalEvents.length} -> ${eventsToSend.length}`);
+
+                            // Debug Stats for User Verification
+                            const rawCount = originalEvents.length;
+                            const simplifiedCount = eventsToSend.length;
+                            const ratio = ((1 - simplifiedCount / rawCount) * 100).toFixed(1);
+
+                            // Calculate bounds to see if stroke is "tiny" (glitch check)
+                            const xs = points.map(p => p.x);
+                            const ys = points.map(p => p.y);
+                            const boundsWidth = Math.max(...xs) - Math.min(...xs);
+                            const boundsHeight = Math.max(...ys) - Math.min(...ys);
+
+                            console.log(`[Whiteboard Debug] Tool: ${toolRef.current}, Pts: ${rawCount} -> ${simplifiedCount} (${ratio}% reduced), Bounds: ${boundsWidth.toFixed(1)}x${boundsHeight.toFixed(1)}`);
                         }
                     }
 
@@ -519,10 +656,27 @@ export default function WhiteboardCanvas() {
                 currentGraphicsRef.current = null;
 
                 history.forEach((stroke: DrawEvent[]) => {
-                    stroke.forEach(point => {
-                        drawLine(point.x, point.y, point.prevX, point.prevY, point.color, point.width);
-                    });
-                    currentGraphicsRef.current = null;
+                    if (stroke.length === 0) return;
+
+                    const firstPoint = stroke[0];
+                    const color = firstPoint.color;
+                    const width = firstPoint.width;
+                    const isEraser = color === 0xffffff;
+
+                    const graphics = new PIXI.Graphics();
+                    if (isEraser) {
+                        graphics.blendMode = 'erase';
+                    }
+
+                    if (isEraser || true) { // FORCE ALL TOOLS TO USE POLYLINE
+                        // Polyline with Smoothing
+                        const points = stroke.map(p => ({ x: p.x, y: p.y }));
+                        drawSmoothStroke(graphics, points, width, color);
+                    }
+
+                    if (drawingContainerRef.current) {
+                        drawingContainerRef.current.addChild(graphics);
+                    }
                 });
             } catch (e) {
                 console.error('Failed to load history', e);
