@@ -28,10 +28,10 @@ type RedisClient struct {
 }
 
 // NewRedisClient creates a new Redis client
-func NewRedisClient(addr string) (*RedisClient, error) {
+func NewRedisClient(addr, password string) (*RedisClient, error) {
 	client := redis.NewClient(&redis.Options{
 		Addr:         addr,
-		Password:     "", // ElastiCache/Valkey default: no password
+		Password:     password,
 		DB:           0,
 		DialTimeout:  5 * time.Second,
 		ReadTimeout:  3 * time.Second,

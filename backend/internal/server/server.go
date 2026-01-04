@@ -109,11 +109,17 @@ func New(cfg *config.Config, db *gorm.DB) *Server {
 	memberService := service.NewMemberService(db)
 	workspaceMW := middleware.NewWorkspaceMiddleware(memberService)
 
+	// Audio handler 생성 및 DB 설정
+	audioHandler := handler.NewAudioHandler(cfg)
+	if roomHub := audioHandler.GetRoomHub(); roomHub != nil {
+		roomHub.SetDB(db)
+	}
+
 	return &Server{
 		app:                   app,
 		cfg:                   cfg,
 		db:                    db,
-		handler:               handler.NewAudioHandler(cfg),
+		handler:               audioHandler,
 		authHandler:           authHandler,
 		userHandler:           userHandler,
 		workspaceHandler:      workspaceHandler,
@@ -268,6 +274,9 @@ func (s *Server) SetupRoutes() {
 	s.app.Post("/api/video/token", auth.AuthMiddleware(s.jwtManager), s.videoHandler.GenerateToken)
 	s.app.Get("/api/video/participants", auth.AuthMiddleware(s.jwtManager), s.videoHandler.GetRoomParticipants)
 	s.app.Get("/api/video/rooms/participants", auth.AuthMiddleware(s.jwtManager), s.videoHandler.GetAllRoomsParticipants)
+
+	// Room Transcripts API (실시간 음성 기록 동기화)
+	s.app.Get("/api/room/:roomId/transcripts", s.handleGetRoomTranscripts)
 
 	// Whiteboard 라우트
 	s.app.Get("/api/whiteboard", s.whiteboardHandler.GetWhiteboard)
@@ -528,4 +537,50 @@ func (s *Server) Start() error {
 // Shutdown 서버 종료
 func (s *Server) Shutdown() error {
 	return s.app.ShutdownWithTimeout(30 * time.Second)
+}
+
+// handleGetRoomTranscripts retrieves transcripts from Redis for a room
+func (s *Server) handleGetRoomTranscripts(c *fiber.Ctx) error {
+	roomID := c.Params("roomId")
+	if roomID == "" {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"error": "roomId is required",
+		})
+	}
+
+	roomHub := s.handler.GetRoomHub()
+	if roomHub == nil {
+		return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{
+			"error": "room hub not available",
+		})
+	}
+
+	transcripts, err := roomHub.GetTranscripts(roomID)
+	if err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+			"error": "failed to get transcripts",
+		})
+	}
+
+	// Convert to response format
+	responses := make([]handler.RoomTranscriptResponse, len(transcripts))
+	for i, t := range transcripts {
+		responses[i] = handler.RoomTranscriptResponse{
+			RoomID:      t.RoomID,
+			SpeakerID:   t.SpeakerID,
+			SpeakerName: t.SpeakerName,
+			Original:    t.Original,
+			Translated:  t.Translated,
+			SourceLang:  t.SourceLang,
+			TargetLang:  t.TargetLang,
+			IsFinal:     t.IsFinal,
+			Timestamp:   t.Timestamp,
+		}
+	}
+
+	return c.JSON(fiber.Map{
+		"roomId":      roomID,
+		"transcripts": responses,
+		"count":       len(responses),
+	})
 }

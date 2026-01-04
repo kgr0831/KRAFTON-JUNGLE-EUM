@@ -30,7 +30,7 @@ func NewAudioHandler(cfg *config.Config) *AudioHandler {
 
 	// Redis/Valkey 클라이언트 초기화
 	if cfg.Redis.Enabled && cfg.Redis.Addr != "" {
-		redisClient, err := cache.NewRedisClient(cfg.Redis.Addr)
+		redisClient, err := cache.NewRedisClient(cfg.Redis.Addr, cfg.Redis.Password)
 		if err != nil {
 			log.Printf("⚠️ Failed to connect to Redis/Valkey: %v (transcript caching disabled)", err)
 		} else {
@@ -80,6 +80,24 @@ func (h *AudioHandler) Close() error {
 		}
 	}
 	return nil
+}
+
+// GetRoomHub returns the RoomHub instance (for setting DB)
+func (h *AudioHandler) GetRoomHub() *RoomHub {
+	return h.roomHub
+}
+
+// RoomTranscriptResponse is the response for room transcripts
+type RoomTranscriptResponse struct {
+	RoomID      string    `json:"roomId"`
+	SpeakerID   string    `json:"speakerId"`
+	SpeakerName string    `json:"speakerName"`
+	Original    string    `json:"original"`
+	Translated  string    `json:"translated,omitempty"`
+	SourceLang  string    `json:"sourceLang"`
+	TargetLang  string    `json:"targetLang,omitempty"`
+	IsFinal     bool      `json:"isFinal"`
+	Timestamp   time.Time `json:"timestamp"`
 }
 
 // HandleWebSocket 오디오 스트리밍 WebSocket 연결 처리
@@ -719,8 +737,11 @@ func (h *AudioHandler) HandleRoomWebSocket(c *websocket.Conn) {
 		if messageType == websocket.BinaryMessage && len(msg) > 0 {
 			// 메시지 형식: [speakerId(36 bytes)][sourceLang(2 bytes)][audio data]
 			if len(msg) < 38 {
+				log.Printf("⚠️ [Room %s] Binary message too short: %d bytes (need >= 38)", roomID, len(msg))
 				continue
 			}
+			// Debug log disabled to reduce noise
+			// log.Printf("🎵 [Room %s] Received audio: %d bytes from listener %s", roomID, len(msg), listenerID)
 
 			speakerID := string(msg[:36])
 			sourceLang := string(msg[36:38])
@@ -739,6 +760,7 @@ func (h *AudioHandler) HandleRoomWebSocket(c *websocket.Conn) {
 				Type       string `json:"type"`
 				SpeakerID  string `json:"speakerId"`
 				SourceLang string `json:"sourceLang"`
+				TargetLang string `json:"targetLang"`
 				Nickname   string `json:"nickname"`
 				ProfileImg string `json:"profileImg"`
 			}
@@ -758,6 +780,14 @@ func (h *AudioHandler) HandleRoomWebSocket(c *websocket.Conn) {
 					// 스피커가 방을 나갔을 때 Transcribe 스트림 종료
 					room.RemoveSpeaker(controlMsg.SpeakerID)
 					log.Printf("👋 [Room %s] Speaker left: %s", roomID, controlMsg.SpeakerID)
+
+				case "update_target_language":
+					// 리스너의 타겟 언어 업데이트
+					if controlMsg.TargetLang != "" {
+						room.UpdateListenerTargetLang(listenerID, controlMsg.TargetLang)
+						log.Printf("🌐 [Room %s] Listener %s updated target language to: %s",
+							roomID, listenerID, controlMsg.TargetLang)
+					}
 				}
 			}
 		}
@@ -768,9 +798,4 @@ func (h *AudioHandler) HandleRoomWebSocket(c *websocket.Conn) {
 func (h *AudioHandler) sendRoomError(c *websocket.Conn, code, message string) {
 	response := fmt.Sprintf(`{"status":"error","code":"%s","message":"%s"}`, code, message)
 	_ = c.WriteMessage(websocket.TextMessage, []byte(response))
-}
-
-// GetRoomHub returns the RoomHub instance for external access
-func (h *AudioHandler) GetRoomHub() *RoomHub {
-	return h.roomHub
 }

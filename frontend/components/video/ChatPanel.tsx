@@ -18,8 +18,10 @@ export interface VoiceRecord {
     profileImg?: string;
     original: string;
     translated?: string;      // 번역 모드일 때만 존재
+    sourceLanguage?: string;  // 원본 언어 (ko, ja, zh, en 등)
     targetLanguage?: string;  // 번역 언어 (ja, zh, en 등)
     timestamp: number;
+    _isFinal?: boolean;       // 내부용: final 여부 추적
 }
 
 interface ChatPanelProps {
@@ -313,7 +315,9 @@ export default function ChatPanel({ roomId, onClose, onNewMessage, voiceRecords 
                                 <div className="pl-8 space-y-2">
                                     {/* Original text */}
                                     <div className="flex items-start gap-2">
-                                        <span className="text-[10px] text-black/40 bg-black/5 px-1.5 py-0.5 rounded mt-0.5 flex-shrink-0">KO</span>
+                                        <span className="text-[10px] text-black/40 bg-black/5 px-1.5 py-0.5 rounded mt-0.5 flex-shrink-0 uppercase">
+                                            {record.sourceLanguage || 'KO'}
+                                        </span>
                                         <p className="text-[13px] text-black/80 leading-relaxed">{record.original}</p>
                                     </div>
                                     {/* Translated text */}
