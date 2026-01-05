@@ -11,6 +11,12 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/transcribestreaming/types"
 )
 
+// Keep-alive configuration
+const (
+	KeepAliveInterval = 10 * time.Second // Send silence every 10 seconds
+	SilenceChunkSize  = 3200             // 100ms of silence at 16kHz mono PCM
+)
+
 // TranscribeClient wraps Amazon Transcribe Streaming
 type TranscribeClient struct {
 	client     *transcribestreaming.Client
@@ -31,6 +37,10 @@ type TranscribeStream struct {
 
 	// Audio input channel
 	audioIn chan []byte
+
+	// Keep-alive
+	lastAudioTime time.Time
+	keepAliveMu   sync.Mutex
 
 	mu       sync.Mutex
 	isClosed bool
@@ -71,6 +81,8 @@ func (c *TranscribeClient) StartStream(ctx context.Context, speakerID, sourceLan
 		log.Printf("[Transcribe] Unknown language '%s', defaulting to en-US", sourceLang)
 	}
 
+	log.Printf("[Transcribe] Starting stream for speaker %s (lang=%s)", speakerID, sourceLang)
+
 	streamCtx, cancel := context.WithCancel(ctx)
 
 	ts := &TranscribeStream{
@@ -80,6 +92,7 @@ func (c *TranscribeClient) StartStream(ctx context.Context, speakerID, sourceLan
 		cancel:         cancel,
 		TranscriptChan: make(chan *TranscriptResult, 50),
 		audioIn:        make(chan []byte, 100),
+		lastAudioTime:  time.Now(),
 		isClosed:       false,
 	}
 
@@ -90,20 +103,25 @@ func (c *TranscribeClient) StartStream(ctx context.Context, speakerID, sourceLan
 		MediaSampleRateHertz: aws.Int32(c.sampleRate),
 	})
 	if err != nil {
+		log.Printf("[Transcribe] ERROR StartStreamTranscription failed: %v", err)
 		cancel()
 		return nil, err
 	}
 
 	ts.eventStream = resp.GetStream()
 
-	// Start goroutines for sending audio and receiving transcripts
+	// Start goroutines
 	go ts.sendAudioLoop()
 	go ts.receiveLoop()
+	go ts.keepAliveLoop() // Keep-alive goroutine
 
-	log.Printf("[Transcribe] Started stream for speaker %s (lang: %s)", speakerID, sourceLang)
+	log.Printf("[Transcribe] Stream started for speaker %s", speakerID)
 
 	return ts, nil
 }
+
+// MaxAudioChunkSize is the recommended audio chunk size for AWS Transcribe
+const MaxAudioChunkSize = 3200
 
 // SendAudio sends audio data to the transcription stream
 func (ts *TranscribeStream) SendAudio(audioData []byte) error {
@@ -114,24 +132,80 @@ func (ts *TranscribeStream) SendAudio(audioData []byte) error {
 	}
 	ts.mu.Unlock()
 
-	select {
-	case ts.audioIn <- audioData:
-		return nil
-	case <-ts.ctx.Done():
-		return ts.ctx.Err()
-	default:
-		log.Printf("[Transcribe] Audio buffer full for speaker %s", ts.speakerID)
-		return nil
+	// Update last audio time for keep-alive
+	ts.keepAliveMu.Lock()
+	ts.lastAudioTime = time.Now()
+	ts.keepAliveMu.Unlock()
+
+	// Split large audio into chunks
+	for offset := 0; offset < len(audioData); offset += MaxAudioChunkSize {
+		end := offset + MaxAudioChunkSize
+		if end > len(audioData) {
+			end = len(audioData)
+		}
+		chunk := audioData[offset:end]
+
+		select {
+		case ts.audioIn <- chunk:
+		case <-ts.ctx.Done():
+			return ts.ctx.Err()
+		default:
+			// Buffer full, skip
+			return nil
+		}
+	}
+	return nil
+}
+
+// keepAliveLoop sends silence audio to keep the stream alive
+func (ts *TranscribeStream) keepAliveLoop() {
+	ticker := time.NewTicker(KeepAliveInterval)
+	defer ticker.Stop()
+
+	// Pre-allocate silence buffer (all zeros = silence in PCM)
+	silenceChunk := make([]byte, SilenceChunkSize)
+
+	for {
+		select {
+		case <-ts.ctx.Done():
+			return
+		case <-ticker.C:
+			ts.keepAliveMu.Lock()
+			timeSinceLastAudio := time.Since(ts.lastAudioTime)
+			ts.keepAliveMu.Unlock()
+
+			// Only send silence if no audio received recently
+			if timeSinceLastAudio >= KeepAliveInterval-time.Second {
+				ts.mu.Lock()
+				closed := ts.isClosed
+				ts.mu.Unlock()
+
+				if !closed {
+					select {
+					case ts.audioIn <- silenceChunk:
+						// Silence sent successfully
+					default:
+						// Buffer full, skip
+					}
+				}
+			}
+		}
 	}
 }
 
 // sendAudioLoop sends audio chunks to Transcribe
 func (ts *TranscribeStream) sendAudioLoop() {
 	defer func() {
+		ts.mu.Lock()
+		ts.isClosed = true
+		ts.mu.Unlock()
 		if ts.eventStream != nil {
 			ts.eventStream.Close()
 		}
 	}()
+
+	audioChunkCount := 0
+	totalBytesSent := 0
 
 	for {
 		select {
@@ -142,13 +216,22 @@ func (ts *TranscribeStream) sendAudioLoop() {
 				return
 			}
 
+			audioChunkCount++
+			totalBytesSent += len(audioData)
+
+			// Log only first chunk and every 100th
+			if audioChunkCount == 1 || audioChunkCount%100 == 0 {
+				log.Printf("[Transcribe] Audio chunk #%d for %s (total: %d bytes)",
+					audioChunkCount, ts.speakerID, totalBytesSent)
+			}
+
 			err := ts.eventStream.Send(ts.ctx, &types.AudioStreamMemberAudioEvent{
 				Value: types.AudioEvent{
 					AudioChunk: audioData,
 				},
 			})
 			if err != nil {
-				log.Printf("[Transcribe] Error sending audio for speaker %s: %v", ts.speakerID, err)
+				log.Printf("[Transcribe] Send error for %s: %v", ts.speakerID, err)
 				return
 			}
 		}
@@ -157,26 +240,36 @@ func (ts *TranscribeStream) sendAudioLoop() {
 
 // receiveLoop receives transcript results from Transcribe
 func (ts *TranscribeStream) receiveLoop() {
-	defer close(ts.TranscriptChan)
+	log.Printf("[Transcribe] 🎧 receiveLoop started for speaker %s", ts.speakerID)
 
-	// Events() returns a channel of transcript events
+	defer func() {
+		ts.mu.Lock()
+		ts.isClosed = true
+		ts.mu.Unlock()
+		close(ts.TranscriptChan)
+		log.Printf("[Transcribe] 🔚 receiveLoop ended for speaker %s", ts.speakerID)
+	}()
+
 	events := ts.eventStream.Events()
 
-	for {
+	for event := range events {
 		select {
 		case <-ts.ctx.Done():
+			log.Printf("[Transcribe] ⏹️ Context cancelled for speaker %s", ts.speakerID)
 			return
-		case event, ok := <-events:
-			if !ok {
-				log.Printf("[Transcribe] Events channel closed for speaker %s", ts.speakerID)
-				return
-			}
-
-			switch e := event.(type) {
-			case *types.TranscriptResultStreamMemberTranscriptEvent:
-				ts.handleTranscriptEvent(e.Value)
-			}
+		default:
 		}
+
+		switch e := event.(type) {
+		case *types.TranscriptResultStreamMemberTranscriptEvent:
+			ts.handleTranscriptEvent(e.Value)
+		}
+	}
+
+	if err := ts.eventStream.Err(); err != nil {
+		log.Printf("[Transcribe] ❌ Stream error for %s: %v", ts.speakerID, err)
+	} else {
+		log.Printf("[Transcribe] ℹ️ Event stream ended normally for %s", ts.speakerID)
 	}
 }
 
@@ -200,10 +293,16 @@ func (ts *TranscribeStream) handleTranscriptEvent(event types.TranscriptEvent) {
 
 		isPartial := result.IsPartial
 
-		// Calculate confidence (average of item confidences)
 		var confidence float32 = 1.0
 		if len(alt.Items) > 0 && alt.Items[0].Confidence != nil {
 			confidence = float32(*alt.Items[0].Confidence)
+		}
+
+		// Debug log for transcript reception
+		if isPartial {
+			log.Printf("[Transcribe] 📝 Partial from %s: '%s' (confidence: %.2f)", ts.speakerID, transcript, confidence)
+		} else {
+			log.Printf("[Transcribe] ✅ Final from %s: '%s' (confidence: %.2f)", ts.speakerID, transcript, confidence)
 		}
 
 		select {
@@ -217,9 +316,16 @@ func (ts *TranscribeStream) handleTranscriptEvent(event types.TranscriptEvent) {
 			TimestampMs: uint64(time.Now().UnixMilli()),
 		}:
 		default:
-			log.Printf("[Transcribe] Transcript channel full for speaker %s", ts.speakerID)
+			log.Printf("[Transcribe] ⚠️ Channel full, dropping transcript: '%s'", transcript)
 		}
 	}
+}
+
+// IsClosed returns whether the stream has been closed
+func (ts *TranscribeStream) IsClosed() bool {
+	ts.mu.Lock()
+	defer ts.mu.Unlock()
+	return ts.isClosed
 }
 
 // Close terminates the transcription stream

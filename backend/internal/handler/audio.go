@@ -8,8 +8,11 @@ import (
 	"time"
 
 	"github.com/gofiber/contrib/websocket"
+	"gorm.io/gorm"
 
 	"realtime-backend/internal/ai"
+	"realtime-backend/internal/cache"
+	"realtime-backend/internal/auth"
 	"realtime-backend/internal/config"
 	"realtime-backend/internal/model"
 	"realtime-backend/internal/session"
@@ -17,36 +20,49 @@ import (
 
 // AudioHandler 오디오 WebSocket 핸들러
 type AudioHandler struct {
-	cfg      *config.Config
-	aiClient *ai.GrpcClient
-	roomHub  *RoomHub // Room 기반 연결 관리
+    cfg         *config.Config
+    db          *gorm.DB
+    aiClient    *ai.GrpcClient
+    roomHub     *RoomHub
+    redisClient *cache.RedisClient
 }
 
 // NewAudioHandler AudioHandler 생성자
-func NewAudioHandler(cfg *config.Config) *AudioHandler {
-	handler := &AudioHandler{cfg: cfg}
+func NewAudioHandler(cfg *config.Config, db *gorm.DB) *AudioHandler {
+	handler := &AudioHandler{cfg: cfg, db: db}
+
+	// Redis/Valkey 클라이언트 초기화
+	if cfg.Redis.Enabled && cfg.Redis.Addr != "" {
+		redisClient, err := cache.NewRedisClient(cfg.Redis.Addr, cfg.Redis.Password)
+		if err != nil {
+			log.Printf("⚠️ Failed to connect to Redis/Valkey: %v (transcript caching disabled)", err)
+		} else {
+			handler.redisClient = redisClient
+			log.Printf("🔴 Connected to Redis/Valkey at %s", cfg.Redis.Addr)
+		}
+	}
 
 	// AI 모드 결정
 	if cfg.AI.Enabled {
 		if cfg.AI.UseAWS {
 			// AWS 직접 사용 모드
 			log.Println("☁️ AWS AI services mode enabled (Transcribe/Translate/Polly)")
-			handler.roomHub = NewRoomHub(nil, cfg, true)
+			handler.roomHub = NewRoomHub(nil, cfg, true, handler.redisClient)
 		} else {
 			// Python gRPC 서버 모드
 			client, err := ai.NewGrpcClient(cfg.AI.ServerAddr)
 			if err != nil {
 				log.Printf("⚠️ Failed to connect to AI server: %v (running in echo mode)", err)
-				handler.roomHub = NewRoomHub(nil, cfg, false)
+				handler.roomHub = NewRoomHub(nil, cfg, false, handler.redisClient)
 			} else {
 				handler.aiClient = client
 				log.Printf("🤖 Connected to AI server at %s", cfg.AI.ServerAddr)
-				handler.roomHub = NewRoomHub(client, cfg, false)
+				handler.roomHub = NewRoomHub(client, cfg, false, handler.redisClient)
 			}
 		}
 	} else {
 		log.Println("ℹ️ AI disabled, running in echo mode")
-		handler.roomHub = NewRoomHub(nil, cfg, false)
+		handler.roomHub = NewRoomHub(nil, cfg, false, handler.redisClient)
 	}
 
 	log.Println("🏠 RoomHub initialized for room-based connections")
@@ -57,9 +73,34 @@ func NewAudioHandler(cfg *config.Config) *AudioHandler {
 // Close 핸들러 리소스 정리
 func (h *AudioHandler) Close() error {
 	if h.aiClient != nil {
-		return h.aiClient.Close()
+		if err := h.aiClient.Close(); err != nil {
+			log.Printf("⚠️ Error closing AI client: %v", err)
+		}
+	}
+	if h.redisClient != nil {
+		if err := h.redisClient.Close(); err != nil {
+			log.Printf("⚠️ Error closing Redis client: %v", err)
+		}
 	}
 	return nil
+}
+
+// GetRoomHub returns the RoomHub instance (for setting DB)
+func (h *AudioHandler) GetRoomHub() *RoomHub {
+	return h.roomHub
+}
+
+// RoomTranscriptResponse is the response for room transcripts
+type RoomTranscriptResponse struct {
+	RoomID      string    `json:"roomId"`
+	SpeakerID   string    `json:"speakerId"`
+	SpeakerName string    `json:"speakerName"`
+	Original    string    `json:"original"`
+	Translated  string    `json:"translated,omitempty"`
+	SourceLang  string    `json:"sourceLang"`
+	TargetLang  string    `json:"targetLang,omitempty"`
+	IsFinal     bool      `json:"isFinal"`
+	Timestamp   time.Time `json:"timestamp"`
 }
 
 // HandleWebSocket 오디오 스트리밍 WebSocket 연결 처리
@@ -92,6 +133,29 @@ func (h *AudioHandler) HandleWebSocket(c *websocket.Conn) {
 		log.Printf("👤 [%s] Participant ID: %s", sess.ID, participantId)
 	}
 
+	// 권한 확인 (CONNECT_VOICE)
+	workspaceIDStr := c.Params("workspaceId")
+	// workspaceID가 없으면 글로벌 WS일 수도 있지만, 여기서는 워크스페이스 컨텍스트 가정
+	if workspaceIDStr != "" {
+		claims, ok := c.Locals("claims").(*auth.Claims)
+		if ok {
+			// int64 파싱
+			var workspaceID int64
+			fmt.Sscanf(workspaceIDStr, "%d", &workspaceID)
+
+			hasPermission, err := auth.CheckPermission(h.db, workspaceID, claims.UserID, "CONNECT_MEDIA")
+			if err != nil {
+				log.Printf("❌ [%s] Permission check failed: %v", sess.ID, err)
+				h.sendErrorResponse(c, sess.ID, "PERMISSION_ERROR", "Internal server error")
+				return
+			}
+			if !hasPermission {
+				log.Printf("❌ [%s] Permission denied: CONNECT_MEDIA", sess.ID)
+				h.sendErrorResponse(c, sess.ID, "PERMISSION_DENIED", "You do not have permission to connect to media")
+				return
+			}
+		}
+	}
 	// Room ID 추출 (Locals에서)
 	if roomId, ok := c.Locals("roomId").(string); ok && roomId != "" {
 		sess.SetRoomID(roomId)
@@ -173,7 +237,10 @@ func (h *AudioHandler) HandleWebSocket(c *websocket.Conn) {
 }
 
 // performHandshake 메타데이터 헤더 수신 및 검증
-func (h *AudioHandler) performHandshake(c *websocket.Conn, sess *session.Session) error {
+func (h *AudioHandler) performHandshake(
+	c *websocket.Conn,
+	sess *session.Session,
+) error {
 	deadline := time.Now().Add(h.cfg.WebSocket.HandshakeTimeout)
 	if err := c.SetReadDeadline(deadline); err != nil {
 		return fmt.Errorf("failed to set read deadline: %w", err)
@@ -327,7 +394,7 @@ func (h *AudioHandler) aiUnifiedWorker(sess *session.Session) {
 		{
 			ParticipantID:      participantID,
 			Nickname:           participantID,
-			TargetLanguage:     targetLang, // 듣고 싶은 언어
+			TargetLanguage:     targetLang,               // 듣고 싶은 언어
 			TranslationEnabled: sourceLang != targetLang, // 소스와 타겟이 다르면 번역 활성화
 		},
 	}
@@ -699,8 +766,11 @@ func (h *AudioHandler) HandleRoomWebSocket(c *websocket.Conn) {
 		if messageType == websocket.BinaryMessage && len(msg) > 0 {
 			// 메시지 형식: [speakerId(36 bytes)][sourceLang(2 bytes)][audio data]
 			if len(msg) < 38 {
+				log.Printf("⚠️ [Room %s] Binary message too short: %d bytes (need >= 38)", roomID, len(msg))
 				continue
 			}
+			// Debug log disabled to reduce noise
+			// log.Printf("🎵 [Room %s] Received audio: %d bytes from listener %s", roomID, len(msg), listenerID)
 
 			speakerID := string(msg[:36])
 			sourceLang := string(msg[36:38])
@@ -719,6 +789,7 @@ func (h *AudioHandler) HandleRoomWebSocket(c *websocket.Conn) {
 				Type       string `json:"type"`
 				SpeakerID  string `json:"speakerId"`
 				SourceLang string `json:"sourceLang"`
+				TargetLang string `json:"targetLang"`
 				Nickname   string `json:"nickname"`
 				ProfileImg string `json:"profileImg"`
 			}
@@ -738,6 +809,14 @@ func (h *AudioHandler) HandleRoomWebSocket(c *websocket.Conn) {
 					// 스피커가 방을 나갔을 때 Transcribe 스트림 종료
 					room.RemoveSpeaker(controlMsg.SpeakerID)
 					log.Printf("👋 [Room %s] Speaker left: %s", roomID, controlMsg.SpeakerID)
+
+				case "update_target_language":
+					// 리스너의 타겟 언어 업데이트
+					if controlMsg.TargetLang != "" {
+						room.UpdateListenerTargetLang(listenerID, controlMsg.TargetLang)
+						log.Printf("🌐 [Room %s] Listener %s updated target language to: %s",
+							roomID, listenerID, controlMsg.TargetLang)
+					}
 				}
 			}
 		}
@@ -748,9 +827,4 @@ func (h *AudioHandler) HandleRoomWebSocket(c *websocket.Conn) {
 func (h *AudioHandler) sendRoomError(c *websocket.Conn, code, message string) {
 	response := fmt.Sprintf(`{"status":"error","code":"%s","message":"%s"}`, code, message)
 	_ = c.WriteMessage(websocket.TextMessage, []byte(response))
-}
-
-// GetRoomHub returns the RoomHub instance for external access
-func (h *AudioHandler) GetRoomHub() *RoomHub {
-	return h.roomHub
 }

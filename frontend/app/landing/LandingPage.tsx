@@ -30,7 +30,9 @@ export function LandingPage() {
   const showContent = useMemo(() => !isLoading && !isAuthenticated, [isLoading, isAuthenticated]);
 
   useEffect(() => {
+    console.log("[LandingPage] Effect. isLoading:", isLoading, "isAuthenticated:", isAuthenticated);
     if (!isLoading && isAuthenticated) {
+      console.log("[LandingPage] Redirecting to /workspace because authenticated");
       router.push("/workspace");
     }
   }, [isLoading, isAuthenticated, router]);
@@ -68,12 +70,13 @@ export function LandingPage() {
   // 로딩 중이거나 인증 확인 중이면 로딩 화면 표시
   if (isLoading || !showContent) {
     return (
-      <div className="h-screen flex items-center justify-center bg-white">
+      <div className="h-screen flex flex-col items-center justify-center bg-white gap-4">
         <img
           src="/kor_eum_black.png"
           alt="Loading"
           className="w-12 h-12 animate-pulse"
         />
+        <p className="text-black/50 text-sm">Landing Loading...</p>
       </div>
     );
   }
@@ -85,9 +88,8 @@ export function LandingPage() {
 
         {/* Header for sections 0, 1, 2 */}
         <header
-          className={`fixed top-0 left-0 right-0 z-50 bg-white/90 backdrop-blur-md border-b border-gray-100 transition-transform duration-500 ease-out ${
-            currentSlide <= 2 ? "translate-y-0" : "-translate-y-full"
-          }`}
+          className={`fixed top-0 left-0 right-0 z-50 bg-white/90 backdrop-blur-md border-b border-gray-100 transition-transform duration-500 ease-out ${currentSlide <= 2 ? "translate-y-0" : "-translate-y-full"
+            }`}
         >
           <div className="px-10 py-5 flex items-center justify-between">
             <img src="/eum_black.png" alt="Eum" className="h-7" />

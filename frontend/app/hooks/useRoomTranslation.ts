@@ -205,6 +205,15 @@ export function useRoomTranslation({
         [audioTracks]
     );
 
+    // Track participant metadata changes (especially sourceLanguage)
+    const participantMetadataInfo = useMemo(
+        () => participants.map(p => {
+            const sourceLang = getParticipantSourceLanguage(p) || 'ko';
+            return `${p.identity}:${sourceLang}`;
+        }).sort().join(','),
+        [participants]
+    );
+
     // Cleanup a single speaker capture
     const cleanupSpeakerCapture = useCallback((speakerId: string) => {
         const capture = speakerCapturesRef.current.get(speakerId);
@@ -436,8 +445,8 @@ export function useRoomTranslation({
 
         const actualListenerId = listenerId || localId;
 
-        // Connect WebSocket
-        const wsUrl = `${WS_ROOM_URL}?roomId=${encodeURIComponent(roomId)}&listenerId=${encodeURIComponent(actualListenerId)}&targetLang=${targetLanguage}`;
+        // Connect WebSocket (use ref for targetLanguage to avoid reconnection)
+        const wsUrl = `${WS_ROOM_URL}?roomId=${encodeURIComponent(roomId)}&listenerId=${encodeURIComponent(actualListenerId)}&targetLang=${targetLanguageRef.current}`;
         console.log(`[RoomTranslation] Connecting to ${wsUrl}`);
 
         const ws = new WebSocket(wsUrl);
@@ -521,8 +530,19 @@ export function useRoomTranslation({
         return () => {
             cleanupAll();
         };
-    // autoPlayTTS, participants는 ref로 관리되므로 dependency에서 제외 (불필요한 재연결 방지)
-    }, [roomId, enabled, targetLanguage, listenerId, localParticipant?.identity, cleanupAll]);
+    // targetLanguage는 ref로 관리하여 재연결 없이 업데이트
+    }, [roomId, enabled, listenerId, localParticipant?.identity, cleanupAll]);
+
+    // Effect: Update target language without reconnecting
+    useEffect(() => {
+        if (wsRef.current?.readyState === WebSocket.OPEN && isConnectedRef.current) {
+            wsRef.current.send(JSON.stringify({
+                type: 'update_target_language',
+                targetLang: targetLanguage,
+            }));
+            console.log(`[RoomTranslation] Updated target language to: ${targetLanguage}`);
+        }
+    }, [targetLanguage]);
 
     // Effect: Manage speaker captures based on audio tracks
     useEffect(() => {
@@ -540,28 +560,48 @@ export function useRoomTranslation({
         const currentSpeakerIds = new Set(speakerCapturesRef.current.keys());
         const newSpeakerIds = new Set(remoteAudioTracks.map(t => t.participant.identity));
 
-        // Add new speakers
+        // Add new speakers or update existing speakers' sourceLang
         for (const trackRef of remoteAudioTracks) {
             const speakerId = trackRef.participant.identity;
-            if (currentSpeakerIds.has(speakerId)) continue;
-
             const participant = trackRef.participant as RemoteParticipant;
             const sourceLang = getParticipantSourceLanguage(participant) || 'ko';
             const nickname = participant.name || participant.identity;
-            const mediaStream = new MediaStream([trackRef.publication!.track!.mediaStreamTrack!]);
 
+            // Check if speaker already exists
+            const existingCapture = speakerCapturesRef.current.get(speakerId);
+            if (existingCapture) {
+                // Update sourceLang if changed
+                if (existingCapture.sourceLang !== sourceLang) {
+                    console.log(`[RoomTranslation] Updating sourceLang for ${speakerId}: ${existingCapture.sourceLang} -> ${sourceLang}`);
+                    existingCapture.sourceLang = sourceLang;
+
+                    // Send updated speaker info to server
+                    if (wsRef.current?.readyState === WebSocket.OPEN) {
+                        wsRef.current.send(JSON.stringify({
+                            type: 'speaker_info',
+                            speakerId,
+                            sourceLang,
+                            nickname,
+                        }));
+                    }
+                }
+                continue;
+            }
+
+            // Start new capture
+            const mediaStream = new MediaStream([trackRef.publication!.track!.mediaStreamTrack!]);
             startSpeakerCapture(speakerId, sourceLang, nickname, mediaStream);
         }
 
         // Remove departed speakers
-        for (const speakerId of currentSpeakerIds) {
+        Array.from(currentSpeakerIds).forEach(speakerId => {
             if (!newSpeakerIds.has(speakerId)) {
                 cleanupSpeakerCapture(speakerId);
             }
-        }
+        });
 
         setActiveParticipantCount(speakerCapturesRef.current.size);
-    }, [audioTrackInfo, participantIds, localParticipant?.identity, audioTracks, startSpeakerCapture, cleanupSpeakerCapture]);
+    }, [audioTrackInfo, participantIds, participantMetadataInfo, localParticipant?.identity, audioTracks, startSpeakerCapture, cleanupSpeakerCapture]);
 
     // Cleanup on unmount
     useEffect(() => {

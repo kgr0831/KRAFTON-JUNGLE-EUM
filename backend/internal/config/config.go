@@ -20,6 +20,15 @@ type Config struct {
 	Auth      AuthConfig
 	S3        S3Config
 	LiveKit   LiveKitConfig
+	Redis     RedisConfig
+}
+
+// RedisConfig ElastiCache/Valkey 설정
+type RedisConfig struct {
+	Addr     string
+	Password string
+	Enabled  bool
+	DB       int
 }
 
 // S3Config AWS S3 설정
@@ -143,6 +152,12 @@ func Load() *Config {
 			Host:      getEnv("LIVEKIT_HOST", "ws://localhost:7880"),
 			APIKey:    getEnv("LIVEKIT_API_KEY", "devkey"),
 			APISecret: getEnv("LIVEKIT_API_SECRET", "secret"),
+		},
+		Redis: RedisConfig{
+			Addr:     getEnv("REDIS_ADDR", ""),
+			Password: getEnv("REDIS_PASSWORD", ""),
+			Enabled:  getBool("REDIS_ENABLED", false),
+			DB:       getInt("REDIS_DB", 0),
 		},
 	}
 }

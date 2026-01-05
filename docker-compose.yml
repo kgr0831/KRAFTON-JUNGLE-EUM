@@ -1,11 +1,15 @@
 version: '3.8'
 
 services:
-  livekit:
-    image: livekit/livekit-server:latest
-    container_name: eum-livekit
-    command: --dev --bind 0.0.0.0
+  redis:
+    image: redis:7-alpine
+    container_name: eum-redis
     ports:
-      - "7880:7880"
-      - "7881:7881"
-      - "7882:7882/udp"
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    command: redis-server --appendonly yes
+    restart: unless-stopped
+
+volumes:
+  redis_data:
