@@ -1,0 +1,23 @@
+@echo off
+echo Hello World!
+echo Starting LiveKit Server...
+docker-compose up -d
+
+echo Starting Backend...
+cd backend
+start /b go run cmd/server/main.go
+cd ..
+
+echo Starting Frontend...
+cd frontend
+echo Building Frontend...
+call npm run build
+echo Starting Frontend (Production)...
+start /b npm run start
+cd ..
+
+echo Waiting for services to start...
+timeout /t 5 >nul
+
+echo Opening Chrome...
+start chrome http://localhost:3000
