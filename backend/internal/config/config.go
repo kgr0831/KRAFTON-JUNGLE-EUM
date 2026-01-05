@@ -28,6 +28,7 @@ type RedisConfig struct {
 	Addr     string
 	Password string
 	Enabled  bool
+	DB       int
 }
 
 // S3Config AWS S3 설정
@@ -156,6 +157,7 @@ func Load() *Config {
 			Addr:     getEnv("REDIS_ADDR", ""),
 			Password: getEnv("REDIS_PASSWORD", ""),
 			Enabled:  getBool("REDIS_ENABLED", false),
+			DB:       getInt("REDIS_DB", 0),
 		},
 	}
 }

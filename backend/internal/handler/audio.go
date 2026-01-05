@@ -8,9 +8,11 @@ import (
 	"time"
 
 	"github.com/gofiber/contrib/websocket"
+	"gorm.io/gorm"
 
 	"realtime-backend/internal/ai"
 	"realtime-backend/internal/cache"
+	"realtime-backend/internal/auth"
 	"realtime-backend/internal/config"
 	"realtime-backend/internal/model"
 	"realtime-backend/internal/session"
@@ -18,15 +20,16 @@ import (
 
 // AudioHandler 오디오 WebSocket 핸들러
 type AudioHandler struct {
-	cfg         *config.Config
-	aiClient    *ai.GrpcClient
-	roomHub     *RoomHub             // Room 기반 연결 관리
-	redisClient *cache.RedisClient   // Redis/Valkey 클라이언트
+    cfg         *config.Config
+    db          *gorm.DB
+    aiClient    *ai.GrpcClient
+    roomHub     *RoomHub
+    redisClient *cache.RedisClient
 }
 
 // NewAudioHandler AudioHandler 생성자
-func NewAudioHandler(cfg *config.Config) *AudioHandler {
-	handler := &AudioHandler{cfg: cfg}
+func NewAudioHandler(cfg *config.Config, db *gorm.DB) *AudioHandler {
+	handler := &AudioHandler{cfg: cfg, db: db}
 
 	// Redis/Valkey 클라이언트 초기화
 	if cfg.Redis.Enabled && cfg.Redis.Addr != "" {
@@ -130,6 +133,29 @@ func (h *AudioHandler) HandleWebSocket(c *websocket.Conn) {
 		log.Printf("👤 [%s] Participant ID: %s", sess.ID, participantId)
 	}
 
+	// 권한 확인 (CONNECT_VOICE)
+	workspaceIDStr := c.Params("workspaceId")
+	// workspaceID가 없으면 글로벌 WS일 수도 있지만, 여기서는 워크스페이스 컨텍스트 가정
+	if workspaceIDStr != "" {
+		claims, ok := c.Locals("claims").(*auth.Claims)
+		if ok {
+			// int64 파싱
+			var workspaceID int64
+			fmt.Sscanf(workspaceIDStr, "%d", &workspaceID)
+
+			hasPermission, err := auth.CheckPermission(h.db, workspaceID, claims.UserID, "CONNECT_MEDIA")
+			if err != nil {
+				log.Printf("❌ [%s] Permission check failed: %v", sess.ID, err)
+				h.sendErrorResponse(c, sess.ID, "PERMISSION_ERROR", "Internal server error")
+				return
+			}
+			if !hasPermission {
+				log.Printf("❌ [%s] Permission denied: CONNECT_MEDIA", sess.ID)
+				h.sendErrorResponse(c, sess.ID, "PERMISSION_DENIED", "You do not have permission to connect to media")
+				return
+			}
+		}
+	}
 	// Room ID 추출 (Locals에서)
 	if roomId, ok := c.Locals("roomId").(string); ok && roomId != "" {
 		sess.SetRoomID(roomId)
@@ -211,7 +237,10 @@ func (h *AudioHandler) HandleWebSocket(c *websocket.Conn) {
 }
 
 // performHandshake 메타데이터 헤더 수신 및 검증
-func (h *AudioHandler) performHandshake(c *websocket.Conn, sess *session.Session) error {
+func (h *AudioHandler) performHandshake(
+	c *websocket.Conn,
+	sess *session.Session,
+) error {
 	deadline := time.Now().Add(h.cfg.WebSocket.HandshakeTimeout)
 	if err := c.SetReadDeadline(deadline); err != nil {
 		return fmt.Errorf("failed to set read deadline: %w", err)
@@ -365,7 +394,7 @@ func (h *AudioHandler) aiUnifiedWorker(sess *session.Session) {
 		{
 			ParticipantID:      participantID,
 			Nickname:           participantID,
-			TargetLanguage:     targetLang, // 듣고 싶은 언어
+			TargetLanguage:     targetLang,               // 듣고 싶은 언어
 			TranslationEnabled: sourceLang != targetLang, // 소스와 타겟이 다르면 번역 활성화
 		},
 	}
