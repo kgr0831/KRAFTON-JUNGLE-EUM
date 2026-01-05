@@ -4,14 +4,112 @@ import { useEffect, useState, useRef, useCallback } from "react";
 import { useRouter } from "next/navigation";
 import { useAuth } from "../lib/auth-context";
 import { usePresence } from "../contexts/presence-context";
-import { apiClient, UserSearchResult, Workspace } from "../lib/api";
+import { apiClient, UserSearchResult, Workspace, WorkspaceCategory } from "../lib/api";
 import { filterActiveMembers } from "../lib/utils";
 import NotificationDropdown from "../components/NotificationDropdown";
 import EditProfileModal from "../../components/EditProfileModal";
 import GlobalUserProfileMenu from "../../components/GlobalUserProfileMenu";
 import StatusIndicator from "../../components/StatusIndicator";
+import {
+  Plus,
+  ArrowRight,
+  Search,
+  X,
+  ArrowLeft,
+  Loader2,
+  FolderPlus,
+  MoreHorizontal,
+  Pencil,
+  Trash2,
+} from "lucide-react";
 
 console.log("[WorkspacePage] Module loaded");
+
+// WorkspaceCard Component
+function WorkspaceCard({
+  workspace,
+  categories,
+  workspaceCategoryMap,
+  draggingWorkspaceId,
+  onDragStart,
+  onDragEnd,
+  onClick,
+}: {
+  workspace: Workspace;
+  categories: WorkspaceCategory[];
+  workspaceCategoryMap: Record<number, number[]>;
+  draggingWorkspaceId: number | null;
+  onDragStart: (e: React.DragEvent, id: number) => void;
+  onDragEnd: () => void;
+  onClick: () => void;
+}) {
+  const activeMembers = filterActiveMembers(workspace.members || []);
+  const displayMembers = activeMembers.slice(0, 5);
+  const wsCategories = workspaceCategoryMap[workspace.id] || [];
+
+  return (
+    <div
+      className={`relative group ${draggingWorkspaceId === workspace.id ? "opacity-50" : ""}`}
+      draggable
+      onDragStart={(e) => onDragStart(e, workspace.id)}
+      onDragEnd={onDragEnd}
+    >
+      <button
+        onClick={onClick}
+        className="w-full p-5 bg-[#222] hover:bg-[#262626] transition-colors text-left cursor-grab active:cursor-grabbing"
+      >
+        {/* Category dots */}
+        {wsCategories.length > 0 && (
+          <div className="flex gap-1 mb-3">
+            {wsCategories.slice(0, 3).map(catId => {
+              const cat = categories.find(c => c.id === catId);
+              return cat ? (
+                <span
+                  key={catId}
+                  className="w-2 h-2 rounded-full"
+                  style={{ backgroundColor: cat.color }}
+                />
+              ) : null;
+            })}
+          </div>
+        )}
+
+        {/* Name */}
+        <h3 className="text-base font-medium text-white truncate mb-1">
+          {workspace.name}
+        </h3>
+
+        {/* Member count */}
+        <p className="text-sm text-white/40 mb-4">
+          멤버 {activeMembers.length}명
+        </p>
+
+        {/* Avatars */}
+        <div className="flex items-center -space-x-2">
+          {displayMembers.map((member) => (
+            <div
+              key={member.id}
+              className="w-7 h-7 rounded-full bg-white/15 ring-2 ring-[#222] group-hover:ring-[#262626] overflow-hidden transition-colors"
+            >
+              {member.user?.profile_img ? (
+                <img src={member.user.profile_img} alt="" className="w-full h-full object-cover" />
+              ) : (
+                <div className="w-full h-full flex items-center justify-center">
+                  <span className="text-[10px] text-white/50">{member.user?.nickname?.charAt(0)}</span>
+                </div>
+              )}
+            </div>
+          ))}
+          {activeMembers.length > 5 && (
+            <div className="w-7 h-7 rounded-full bg-white/10 ring-2 ring-[#222] group-hover:ring-[#262626] flex items-center justify-center transition-colors">
+              <span className="text-[10px] text-white/50">+{activeMembers.length - 5}</span>
+            </div>
+          )}
+        </div>
+      </button>
+    </div>
+  );
+}
 
 export default function WorkspacePage() {
   const router = useRouter();
@@ -23,12 +121,37 @@ export default function WorkspacePage() {
   const [newWorkspaceName, setNewWorkspaceName] = useState("");
   const [createStep, setCreateStep] = useState<1 | 2>(1);
 
-  // 워크스페이스 관련 state
   const [workspaces, setWorkspaces] = useState<Workspace[]>([]);
   const [isLoadingWorkspaces, setIsLoadingWorkspaces] = useState(true);
   const [isCreating, setIsCreating] = useState(false);
 
-  // 멤버 초대 관련 state
+  // Pagination
+  const ITEMS_PER_PAGE = 10;
+  const [hasMore, setHasMore] = useState(true);
+  const [isLoadingMore, setIsLoadingMore] = useState(false);
+  const [totalWorkspaces, setTotalWorkspaces] = useState(0);
+  const loadMoreRef = useRef<HTMLDivElement>(null);
+
+  // Workspace Search
+  const [workspaceSearchQuery, setWorkspaceSearchQuery] = useState("");
+  const [debouncedSearchQuery, setDebouncedSearchQuery] = useState("");
+  const workspaceSearchTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+
+  // Categories
+  const [categories, setCategories] = useState<WorkspaceCategory[]>([]);
+  const [selectedCategoryId, setSelectedCategoryId] = useState<number | null>(null);
+  const [showCategoryModal, setShowCategoryModal] = useState(false);
+  const [newCategoryName, setNewCategoryName] = useState("");
+  const [newCategoryColor, setNewCategoryColor] = useState("#6366f1");
+  const [editingCategory, setEditingCategory] = useState<WorkspaceCategory | null>(null);
+  const [categoryMenuOpen, setCategoryMenuOpen] = useState<number | null>(null);
+  const [isCreatingCategory, setIsCreatingCategory] = useState(false);
+  const [workspaceCategoryMap, setWorkspaceCategoryMap] = useState<Record<number, number[]>>({});
+
+  // Drag and drop
+  const [draggingWorkspaceId, setDraggingWorkspaceId] = useState<number | null>(null);
+  const [dragOverCategoryId, setDragOverCategoryId] = useState<number | "uncategorized" | null>(null);
+
   const [searchQuery, setSearchQuery] = useState("");
   const [searchResults, setSearchResults] = useState<UserSearchResult[]>([]);
   const [selectedMembers, setSelectedMembers] = useState<UserSearchResult[]>([]);
@@ -39,7 +162,6 @@ export default function WorkspacePage() {
 
   const handleOpenModal = () => {
     setShowNewWorkspace(true);
-    // 비디오 재생 시작
     if (videoRef.current) {
       videoRef.current.currentTime = 0;
       videoRef.current.play();
@@ -56,14 +178,12 @@ export default function WorkspacePage() {
       setSearchQuery("");
       setSearchResults([]);
       setSelectedMembers([]);
-      // 비디오 일시정지
       if (videoRef.current) {
         videoRef.current.pause();
       }
-    }, 1000);
+    }, 600);
   };
 
-  // 유저 검색 (debounce 적용)
   const handleSearch = useCallback(async (query: string) => {
     if (query.length < 2) {
       setSearchResults([]);
@@ -73,7 +193,6 @@ export default function WorkspacePage() {
     setIsSearching(true);
     try {
       const result = await apiClient.searchUsers(query);
-      // 이미 선택된 멤버는 검색 결과에서 제외
       const filteredUsers = result.users.filter(
         (u) => !selectedMembers.some((m) => m.id === u.id)
       );
@@ -86,7 +205,6 @@ export default function WorkspacePage() {
     }
   }, [selectedMembers]);
 
-  // 검색어 변경 시 debounce 적용
   useEffect(() => {
     if (searchTimeoutRef.current) {
       clearTimeout(searchTimeoutRef.current);
@@ -103,7 +221,6 @@ export default function WorkspacePage() {
     };
   }, [searchQuery, handleSearch]);
 
-  // 멤버 추가
   const handleAddMember = (user: UserSearchResult) => {
     setSelectedMembers((prev) => [...prev, user]);
     setSearchQuery("");
@@ -115,42 +232,305 @@ export default function WorkspacePage() {
     setIsEditProfileModalOpen(false);
   };
 
-  // 멤버 제거
   const handleRemoveMember = (userId: number) => {
     setSelectedMembers((prev) => prev.filter((m) => m.id !== userId));
   };
 
-  // 다음 단계로 이동
   const handleNextStep = () => {
     if (newWorkspaceName.trim()) {
       setCreateStep(2);
     }
   };
 
-  // 이전 단계로 이동
   const handlePrevStep = () => {
     setCreateStep(1);
     setSearchQuery("");
     setSearchResults([]);
   };
 
-  // 워크스페이스 목록 조회
-  const fetchWorkspaces = useCallback(async () => {
+  const fetchWorkspaces = useCallback(async (reset = true) => {
     try {
-      setIsLoadingWorkspaces(true);
-      console.log("[WorkspacePage] Fetching workspaces...");
-      const response = await apiClient.getMyWorkspaces();
-      console.log("[WorkspacePage] Fetched workspaces:", response.workspaces.length);
-      setWorkspaces(response.workspaces);
+      if (reset) {
+        setIsLoadingWorkspaces(true);
+        setWorkspaces([]);
+      } else {
+        setIsLoadingMore(true);
+      }
+
+      const offset = reset ? 0 : workspaces.length;
+      const response = await apiClient.getMyWorkspaces({
+        limit: ITEMS_PER_PAGE,
+        offset,
+        search: debouncedSearchQuery || undefined,
+        category_id: selectedCategoryId || undefined,
+      });
+
+      if (reset) {
+        setWorkspaces(response.workspaces);
+        // Initialize category map from workspace data
+        const newMap: Record<number, number[]> = {};
+        response.workspaces.forEach(ws => {
+          if (ws.category_ids && ws.category_ids.length > 0) {
+            newMap[ws.id] = ws.category_ids;
+          }
+        });
+        setWorkspaceCategoryMap(newMap);
+      } else {
+        setWorkspaces(prev => [...prev, ...response.workspaces]);
+        // Append to category map
+        setWorkspaceCategoryMap(prev => {
+          const newMap = { ...prev };
+          response.workspaces.forEach(ws => {
+            if (ws.category_ids && ws.category_ids.length > 0) {
+              newMap[ws.id] = ws.category_ids;
+            }
+          });
+          return newMap;
+        });
+      }
+
+      setTotalWorkspaces(response.total);
+      setHasMore(response.has_more ?? (offset + response.workspaces.length < response.total));
     } catch (error) {
       console.error("[WorkspacePage] Failed to fetch workspaces:", error);
     } finally {
-      console.log("[WorkspacePage] fetchWorkspaces finally. Setting isLoadingWorkspaces false.");
       setIsLoadingWorkspaces(false);
+      setIsLoadingMore(false);
+    }
+  }, [debouncedSearchQuery, selectedCategoryId, workspaces.length]);
+
+  // Fetch categories
+  const fetchCategories = useCallback(async () => {
+    try {
+      const response = await apiClient.getMyCategories();
+      setCategories(response.categories);
+    } catch (error) {
+      console.error("[WorkspacePage] Failed to fetch categories:", error);
     }
   }, []);
 
-  // 워크스페이스 생성 완료
+  // Debounced search
+  useEffect(() => {
+    if (workspaceSearchTimeoutRef.current) {
+      clearTimeout(workspaceSearchTimeoutRef.current);
+    }
+
+    workspaceSearchTimeoutRef.current = setTimeout(() => {
+      setDebouncedSearchQuery(workspaceSearchQuery);
+    }, 300);
+
+    return () => {
+      if (workspaceSearchTimeoutRef.current) {
+        clearTimeout(workspaceSearchTimeoutRef.current);
+      }
+    };
+  }, [workspaceSearchQuery]);
+
+  // Re-fetch when search or category changes
+  useEffect(() => {
+    if (isAuthenticated) {
+      fetchWorkspaces(true);
+    }
+  }, [debouncedSearchQuery, selectedCategoryId, isAuthenticated]);
+
+  // Infinite scroll observer
+  useEffect(() => {
+    const observer = new IntersectionObserver(
+      (entries) => {
+        if (entries[0].isIntersecting && hasMore && !isLoadingMore && !isLoadingWorkspaces) {
+          fetchWorkspaces(false);
+        }
+      },
+      { threshold: 0.1 }
+    );
+
+    if (loadMoreRef.current) {
+      observer.observe(loadMoreRef.current);
+    }
+
+    return () => observer.disconnect();
+  }, [hasMore, isLoadingMore, isLoadingWorkspaces, fetchWorkspaces]);
+
+  // Category handlers
+  const handleCreateCategory = async () => {
+    if (!newCategoryName.trim() || isCreatingCategory) return;
+
+    try {
+      setIsCreatingCategory(true);
+      await apiClient.createCategory({
+        name: newCategoryName,
+        color: newCategoryColor,
+      });
+      await fetchCategories();
+      setShowCategoryModal(false);
+      setNewCategoryName("");
+      setNewCategoryColor("#6366f1");
+    } catch (error) {
+      console.error("Failed to create category:", error);
+    } finally {
+      setIsCreatingCategory(false);
+    }
+  };
+
+  const handleUpdateCategory = async () => {
+    if (!editingCategory || !newCategoryName.trim() || isCreatingCategory) return;
+
+    try {
+      setIsCreatingCategory(true);
+      await apiClient.updateCategory(editingCategory.id, {
+        name: newCategoryName,
+        color: newCategoryColor,
+      });
+      await fetchCategories();
+      setEditingCategory(null);
+      setShowCategoryModal(false);
+      setNewCategoryName("");
+      setNewCategoryColor("#6366f1");
+    } catch (error) {
+      console.error("Failed to update category:", error);
+    } finally {
+      setIsCreatingCategory(false);
+    }
+  };
+
+  const handleDeleteCategory = async (categoryId: number) => {
+    if (!confirm("이 카테고리를 삭제하시겠습니까?")) return;
+
+    try {
+      await apiClient.deleteCategory(categoryId);
+      await fetchCategories();
+      if (selectedCategoryId === categoryId) {
+        setSelectedCategoryId(null);
+      }
+      setCategoryMenuOpen(null);
+    } catch (error) {
+      console.error("Failed to delete category:", error);
+    }
+  };
+
+  const openEditCategory = (category: WorkspaceCategory) => {
+    setEditingCategory(category);
+    setNewCategoryName(category.name);
+    setNewCategoryColor(category.color);
+    setShowCategoryModal(true);
+    setCategoryMenuOpen(null);
+  };
+
+  // 워크스페이스가 어떤 카테고리에 속해있는지 확인 (임시로 로컬 상태 사용)
+  const isWorkspaceInCategory = (workspaceId: number, categoryId: number) => {
+    return workspaceCategoryMap[workspaceId]?.includes(categoryId) || false;
+  };
+
+  const toggleWorkspaceCategory = async (workspaceId: number, categoryId: number) => {
+    const isIn = isWorkspaceInCategory(workspaceId, categoryId);
+
+    try {
+      if (isIn) {
+        await apiClient.removeWorkspaceFromCategory(categoryId, workspaceId);
+        setWorkspaceCategoryMap(prev => ({
+          ...prev,
+          [workspaceId]: (prev[workspaceId] || []).filter(id => id !== categoryId)
+        }));
+      } else {
+        await apiClient.addWorkspaceToCategory(categoryId, workspaceId);
+        setWorkspaceCategoryMap(prev => ({
+          ...prev,
+          [workspaceId]: [...(prev[workspaceId] || []), categoryId]
+        }));
+      }
+      await fetchCategories();
+    } catch (error) {
+      console.error("Failed to toggle workspace category:", error);
+    }
+  };
+
+  // Drag handlers
+  const handleDragStart = (e: React.DragEvent, workspaceId: number) => {
+    setDraggingWorkspaceId(workspaceId);
+    e.dataTransfer.effectAllowed = "move";
+    e.dataTransfer.setData("text/plain", workspaceId.toString());
+  };
+
+  const handleDragEnd = () => {
+    setDraggingWorkspaceId(null);
+    setDragOverCategoryId(null);
+  };
+
+  const handleDragOver = (e: React.DragEvent, categoryId: number | "uncategorized") => {
+    e.preventDefault();
+    e.dataTransfer.dropEffect = "move";
+    setDragOverCategoryId(categoryId);
+  };
+
+  const handleDragLeave = () => {
+    setDragOverCategoryId(null);
+  };
+
+  // 워크스페이스를 새 카테고리로 이동 (기존 카테고리에서 제거 후 새 카테고리에 추가)
+  const moveWorkspaceToCategory = async (workspaceId: number, targetCategoryId: number) => {
+    const currentCategories = workspaceCategoryMap[workspaceId] || [];
+
+    try {
+      // 기존 카테고리에서 제거
+      for (const catId of currentCategories) {
+        if (catId !== targetCategoryId) {
+          await apiClient.removeWorkspaceFromCategory(catId, workspaceId);
+        }
+      }
+
+      // 새 카테고리에 추가 (이미 있지 않은 경우)
+      if (!currentCategories.includes(targetCategoryId)) {
+        await apiClient.addWorkspaceToCategory(targetCategoryId, workspaceId);
+      }
+
+      // 상태 업데이트
+      setWorkspaceCategoryMap(prev => ({
+        ...prev,
+        [workspaceId]: [targetCategoryId]
+      }));
+
+      await fetchCategories();
+    } catch (error) {
+      console.error("Failed to move workspace:", error);
+    }
+  };
+
+  // 워크스페이스의 모든 카테고리 제거
+  const removeAllCategories = async (workspaceId: number) => {
+    const currentCategories = workspaceCategoryMap[workspaceId] || [];
+
+    try {
+      for (const catId of currentCategories) {
+        await apiClient.removeWorkspaceFromCategory(catId, workspaceId);
+      }
+
+      setWorkspaceCategoryMap(prev => ({
+        ...prev,
+        [workspaceId]: []
+      }));
+
+      await fetchCategories();
+    } catch (error) {
+      console.error("Failed to remove categories:", error);
+    }
+  };
+
+  const handleDrop = async (e: React.DragEvent, categoryId: number | "uncategorized") => {
+    e.preventDefault();
+    setDragOverCategoryId(null);
+
+    if (draggingWorkspaceId) {
+      if (categoryId === "uncategorized") {
+        // 미분류로 드롭: 모든 카테고리 제거
+        await removeAllCategories(draggingWorkspaceId);
+      } else {
+        // 특정 카테고리로 드롭: 해당 카테고리로 이동
+        await moveWorkspaceToCategory(draggingWorkspaceId, categoryId);
+      }
+    }
+    setDraggingWorkspaceId(null);
+  };
+
   const handleCreateWorkspace = async () => {
     if (isCreating) return;
 
@@ -161,11 +541,8 @@ export default function WorkspacePage() {
         member_ids: selectedMembers.map((m) => m.id),
       });
 
-      // 워크스페이스 목록 새로고침
       await fetchWorkspaces();
       handleCloseModal();
-
-      // 새로 생성된 워크스페이스로 이동
       router.push(`/workspace/${newWorkspace.id}`);
     } catch (error) {
       console.error("Failed to create workspace:", error);
@@ -175,26 +552,20 @@ export default function WorkspacePage() {
     }
   };
 
-  // 인증 상태 체크 및 워크스페이스 로드
   useEffect(() => {
-    console.log("[WorkspacePage] Auth Effect. isLoading:", isLoading, "isAuthenticated:", isAuthenticated);
     if (!isLoading && !isAuthenticated) {
-      console.log("[WorkspacePage] Redirecting to / because NOT authenticated");
       router.push("/");
     }
   }, [isLoading, isAuthenticated, router]);
 
-  // 워크스페이스 목록 로드
   useEffect(() => {
     if (isAuthenticated) {
-      console.log("[WorkspacePage] Authenticated, calling fetchWorkspaces");
-      fetchWorkspaces();
+      fetchCategories();
     }
-  }, [isAuthenticated, fetchWorkspaces]);
+  }, [isAuthenticated, fetchCategories]);
 
-  const { presenceMap, subscribePresence } = usePresence(); // Destructure properly
+  const { presenceMap, subscribePresence } = usePresence();
 
-  // Subscribe to presence for all workspace members
   useEffect(() => {
     if (workspaces.length > 0) {
       const allMemberIds = new Set<number>();
@@ -214,14 +585,11 @@ export default function WorkspacePage() {
     router.push("/");
   };
 
+
   if (isLoading) {
     return (
-      <div className="min-h-screen flex items-center justify-center bg-white">
-        <img
-          src="/kor_eum_black.png"
-          alt="Loading"
-          className="w-12 h-12 animate-pulse"
-        />
+      <div className="min-h-screen flex items-center justify-center bg-[#1a1a1a]" style={{ fontFamily: "'Cafe24ProSlim', sans-serif" }}>
+        <div className="w-1 h-8 bg-white/40" />
       </div>
     );
   }
@@ -231,61 +599,88 @@ export default function WorkspacePage() {
   }
 
   return (
-    <div className="min-h-screen bg-white relative overflow-y-auto">
+    <div
+      className="min-h-screen bg-[#1a1a1a] text-white flex"
+      style={{ fontFamily: "'Cafe24ProSlim', sans-serif" }}
+    >
+      {/* Left Panel */}
+      <div className="hidden lg:flex w-[420px] min-h-screen flex-col justify-between p-10 border-r border-white/10">
+        {/* Top */}
+        <div>
+          <img src="/eum_white.png" alt="EUM" className="h-5" />
+        </div>
 
-      {/* Background Images */}
-      <img
-        src="/workspace-left-top-background.png"
-        alt=""
-        className="fixed top-10 -left-10 h-[26vh] w-auto pointer-events-none select-none opacity-40"
-      />
-      <img
-        src="/workspace-right-background.png"
-        alt=""
-        className="fixed bottom-0 -right-20 h-screen w-auto pointer-events-none select-none opacity-50"
-      />
+        {/* Center - Typography */}
+        <div className="space-y-8">
+          <div className="space-y-3">
+            <p className="text-white/50 text-sm tracking-wide">Welcome back</p>
+            <h1 className="text-[48px] font-bold leading-[1.1] tracking-tight text-white">
+              {user.nickname}
+            </h1>
+          </div>
 
-      {/* Header */}
-      <header className="fixed top-0 left-0 right-0 z-50 bg-white border-b border-black/5">
-        <div className="max-w-6xl mx-auto px-8 h-16 flex items-center justify-between">
-          {/* Logo */}
-          <img src="/eum_black.png" alt="EUM" className="h-6" />
+          <div className="w-16 h-[2px] bg-white/30" />
 
-          {/* Header Right Section */}
+          <div className="space-y-2">
+            <p className="text-white/60 text-base">
+              {workspaces.length > 0
+                ? `${workspaces.length}개의 워크스페이스`
+                : "워크스페이스 없음"}
+            </p>
+          </div>
+        </div>
+
+        {/* Bottom - Create Button */}
+        <button
+          onClick={handleOpenModal}
+          className="group flex items-center justify-between py-5 border-t border-white/10 hover:border-white/20 transition-colors"
+        >
+          <span className="text-base text-white/70 group-hover:text-white transition-colors">
+            새 워크스페이스 만들기
+          </span>
+          <ArrowRight size={18} className="text-white/40 group-hover:text-white group-hover:translate-x-1 transition-all" />
+        </button>
+      </div>
+
+      {/* Right Panel */}
+      <div className="flex-1 flex flex-col min-h-screen">
+        {/* Header */}
+        <header className="flex items-center justify-between px-6 lg:px-10 h-16 border-b border-white/10">
+          <img src="/eum_white.png" alt="EUM" className="h-4 lg:hidden" />
+
+          <div className="hidden lg:block" />
+
           <div className="flex items-center gap-3">
-            {/* Notification Button */}
             <NotificationDropdown onInvitationAccepted={() => fetchWorkspaces()} />
 
-            {/* Profile */}
             <div className="relative">
               <button
                 onClick={() => setShowProfileMenu(!showProfileMenu)}
-                className="flex items-center gap-3 hover:opacity-70 transition-opacity"
+                className="flex items-center gap-3 py-1.5 px-2 -mx-2 rounded-lg hover:bg-white/5 transition-colors"
               >
                 <div className="relative">
                   {user.profileImg ? (
                     <img
                       src={user.profileImg}
                       alt={user.nickname}
-                      className="w-9 h-9 rounded-full object-cover"
+                      className="w-8 h-8 rounded-full object-cover"
                     />
                   ) : (
-                    <div className="w-9 h-9 rounded-full bg-black flex items-center justify-center">
+                    <div className="w-8 h-8 rounded-full bg-white/20 flex items-center justify-center">
                       <span className="text-sm font-medium text-white">
                         {user.nickname.charAt(0).toUpperCase()}
                       </span>
                     </div>
                   )}
-                  {/* Status Indicator */}
                   <StatusIndicator
                     status={presenceMap[user.id]?.status || user.default_status || "online"}
                     size="sm"
-                    className="absolute bottom-0 right-0 ring-2 ring-white"
+                    className="absolute -bottom-0.5 -right-0.5 ring-2 ring-[#1a1a1a]"
                   />
                 </div>
+                <span className="hidden sm:block text-sm text-white/80">{user.nickname}</span>
               </button>
 
-              {/* Global Profile Menu */}
               {showProfileMenu && (
                 <GlobalUserProfileMenu
                   onClose={() => setShowProfileMenu(false)}
@@ -298,524 +693,584 @@ export default function WorkspacePage() {
               )}
             </div>
           </div>
-        </div>
-      </header>
+        </header>
 
-      {/* Edit Profile Modal */}
-      {isEditProfileModalOpen && user && (
-        <EditProfileModal
-          user={user}
-          onClose={() => setIsEditProfileModalOpen(false)}
-          onUpdate={handleUpdateProfile}
-        />
-      )}
+        {isEditProfileModalOpen && user && (
+          <EditProfileModal
+            user={user}
+            onClose={() => setIsEditProfileModalOpen(false)}
+            onUpdate={handleUpdateProfile}
+          />
+        )}
 
-      {/* Main Content */}
-      <main className="pt-16 relative z-10">
-        <div className="max-w-4xl ml-8 lg:ml-16 xl:ml-24 px-8 py-16">
-          {/* Greeting */}
-          <div className="mb-16">
-            <h1 className="text-4xl font-light text-black">
-              안녕하세요, <span className="font-medium">{user.nickname}</span>님
-            </h1>
-            <p className="text-black/40 mt-2">워크스페이스를 선택하거나 새로 만들어보세요</p>
-          </div>
-
-          {/* Workspace Section */}
-          <section>
-            <div className="flex items-center justify-between mb-8">
-              <h2 className="text-sm font-medium text-black/40 uppercase tracking-wider">
-                내 워크스페이스
-              </h2>
+        {/* Content */}
+        <main className="flex-1 overflow-y-auto">
+          <div className="px-6 lg:px-10 py-10">
+            {/* Mobile Header */}
+            <div className="lg:hidden mb-10">
+              <p className="text-white/50 text-xs tracking-wide uppercase mb-2">Welcome back</p>
+              <h1 className="text-3xl font-bold tracking-tight text-white">{user.nickname}</h1>
             </div>
 
-            {/* Loading State */}
-            {isLoadingWorkspaces && (
-              <div className="flex items-center justify-center py-20">
-                <div className="w-8 h-8 border-2 border-black/20 border-t-black/60 rounded-full animate-spin" />
-              </div>
-            )}
-
-            {/* Empty State - 워크스페이스가 없을 때 */}
-            {!isLoadingWorkspaces && workspaces.length === 0 && (
-              <div className="flex flex-col items-center justify-center py-20">
-                <img
-                  src="/logo_black.png"
-                  alt=""
-                  className="w-20 h-20 object-contain opacity-10 mb-6"
+            {/* Search & Filter Bar */}
+            <div className="mb-6 space-y-4">
+              {/* Search */}
+              <div className="relative">
+                <Search size={16} className="absolute left-4 top-1/2 -translate-y-1/2 text-white/30" />
+                <input
+                  type="text"
+                  value={workspaceSearchQuery}
+                  onChange={(e) => setWorkspaceSearchQuery(e.target.value)}
+                  placeholder="워크스페이스 검색..."
+                  className="w-full bg-[#222] py-3 pl-11 pr-4 text-sm text-white placeholder:text-white/30 outline-none focus:ring-1 focus:ring-white/20 transition-all"
                 />
-                <p className="text-black/40 mb-8">아직 워크스페이스가 없습니다</p>
-                <button
-                  onClick={handleOpenModal}
-                  className="group flex items-center gap-3 px-8 py-3 bg-black text-white rounded-full hover:bg-black/80 transition-all duration-300"
-                >
-                  <svg
-                    className="w-5 h-5"
-                    fill="none"
-                    stroke="currentColor"
-                    viewBox="0 0 24 24"
+                {workspaceSearchQuery && (
+                  <button
+                    onClick={() => setWorkspaceSearchQuery("")}
+                    className="absolute right-4 top-1/2 -translate-y-1/2 text-white/30 hover:text-white/60"
                   >
-                    <path
-                      strokeLinecap="round"
-                      strokeLinejoin="round"
-                      strokeWidth={2}
-                      d="M12 4v16m8-8H4"
-                    />
-                  </svg>
-                  <span className="font-medium">새 워크스페이스 만들기</span>
+                    <X size={14} />
+                  </button>
+                )}
+              </div>
+
+              {/* Categories */}
+              <div className="flex items-center gap-2 overflow-x-auto pb-1 scrollbar-hide">
+                {/* All */}
+                <button
+                  onClick={() => setSelectedCategoryId(null)}
+                  onDragOver={(e) => handleDragOver(e, "uncategorized")}
+                  onDragLeave={handleDragLeave}
+                  onDrop={(e) => handleDrop(e, "uncategorized")}
+                  className={`flex-shrink-0 px-4 py-2 text-sm transition-all ${
+                    dragOverCategoryId === "uncategorized"
+                      ? "bg-white/20 ring-2 ring-white/50 scale-105"
+                      : selectedCategoryId === null
+                      ? "bg-white text-[#1a1a1a] font-medium"
+                      : "bg-[#222] text-white/60 hover:text-white"
+                  }`}
+                >
+                  전체
                 </button>
+
+                {/* Category Buttons */}
+                {categories.map((category) => (
+                  <div key={category.id} className="relative flex-shrink-0">
+                    <button
+                      onClick={() => setSelectedCategoryId(category.id)}
+                      onDragOver={(e) => handleDragOver(e, category.id)}
+                      onDragLeave={handleDragLeave}
+                      onDrop={(e) => handleDrop(e, category.id)}
+                      className={`flex items-center gap-2 px-4 py-2 text-sm transition-all ${
+                        dragOverCategoryId === category.id
+                          ? "bg-white/20 ring-2 ring-white/50 scale-105"
+                          : selectedCategoryId === category.id
+                          ? "bg-white text-[#1a1a1a] font-medium"
+                          : "bg-[#222] text-white/60 hover:text-white"
+                      }`}
+                    >
+                      <span
+                        className="w-2 h-2 rounded-full"
+                        style={{ backgroundColor: category.color }}
+                      />
+                      <span>{category.name}</span>
+                      {category.workspace_count !== undefined && (
+                        <span className={selectedCategoryId === category.id ? "text-[#1a1a1a]/60" : "text-white/30"}>
+                          {category.workspace_count}
+                        </span>
+                      )}
+                    </button>
+
+                    {/* Category Menu Button */}
+                    <button
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        setCategoryMenuOpen(categoryMenuOpen === category.id ? null : category.id);
+                      }}
+                      className={`absolute -right-1 -top-1 w-5 h-5 rounded-full flex items-center justify-center opacity-0 hover:opacity-100 focus:opacity-100 ${
+                        categoryMenuOpen === category.id ? "opacity-100" : ""
+                      } bg-[#333] text-white/60 hover:text-white transition-all`}
+                    >
+                      <MoreHorizontal size={10} />
+                    </button>
+
+                    {/* Category Menu Dropdown */}
+                    {categoryMenuOpen === category.id && (
+                      <>
+                        <div
+                          className="fixed inset-0 z-10"
+                          onClick={() => setCategoryMenuOpen(null)}
+                        />
+                        <div className="absolute top-full left-0 mt-2 w-32 bg-[#252525] border border-white/10 rounded-lg overflow-hidden z-20 shadow-xl">
+                          <button
+                            onClick={() => openEditCategory(category)}
+                            className="w-full flex items-center gap-2 px-3 py-2 text-sm text-white/70 hover:bg-white/5 transition-colors"
+                          >
+                            <Pencil size={12} />
+                            수정
+                          </button>
+                          <button
+                            onClick={() => handleDeleteCategory(category.id)}
+                            className="w-full flex items-center gap-2 px-3 py-2 text-sm text-red-400 hover:bg-red-500/10 transition-colors"
+                          >
+                            <Trash2 size={12} />
+                            삭제
+                          </button>
+                        </div>
+                      </>
+                    )}
+                  </div>
+                ))}
+
+                {/* Add Category Button */}
+                <button
+                  onClick={() => {
+                    setEditingCategory(null);
+                    setNewCategoryName("");
+                    setNewCategoryColor("#6366f1");
+                    setShowCategoryModal(true);
+                  }}
+                  className="flex-shrink-0 flex items-center gap-1.5 px-3 py-2 text-sm text-white/40 hover:text-white/70 bg-[#222] hover:bg-[#262626] transition-colors"
+                >
+                  <FolderPlus size={14} />
+                  <span>카테고리</span>
+                </button>
+              </div>
+            </div>
+
+            {/* Section Title */}
+            <div className="flex items-baseline justify-between mb-4">
+              <h2 className="text-sm text-white/50 uppercase tracking-[0.15em]">
+                Workspaces {totalWorkspaces > 0 && `(${totalWorkspaces})`}
+              </h2>
+              <button
+                onClick={handleOpenModal}
+                className="lg:hidden text-sm text-white/60 hover:text-white transition-colors"
+              >
+                + 새로 만들기
+              </button>
+            </div>
+
+            {/* Loading */}
+            {isLoadingWorkspaces && (
+              <div className="py-20 flex justify-center">
+                <div className="w-1 h-8 bg-white/40 animate-pulse" />
               </div>
             )}
 
-            {/* Workspace Grid - 워크스페이스가 있을 때만 표시 */}
+            {/* Empty State */}
+            {!isLoadingWorkspaces && workspaces.length === 0 && (
+              <div className="py-20 text-center">
+                <p className="text-white/40 text-lg mb-6">
+                  {debouncedSearchQuery
+                    ? "검색 결과가 없습니다"
+                    : selectedCategoryId
+                    ? "이 카테고리에 워크스페이스가 없습니다"
+                    : "아직 워크스페이스가 없습니다"}
+                </p>
+                {!debouncedSearchQuery && !selectedCategoryId && (
+                  <button
+                    onClick={handleOpenModal}
+                    className="inline-flex items-center gap-2 text-base text-white/80 hover:text-white border-b-2 border-white/30 hover:border-white pb-1 transition-all"
+                  >
+                    <span>첫 번째 워크스페이스 만들기</span>
+                    <ArrowRight size={16} />
+                  </button>
+                )}
+              </div>
+            )}
+
+            {/* Workspace List */}
             {!isLoadingWorkspaces && workspaces.length > 0 && (
-              <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
-                {/* New Workspace Card */}
-                <button
-                  className="group h-56 border-2 border-dashed border-black/10 hover:border-black/30 transition-all duration-300 flex flex-col items-center justify-center gap-4 hover:bg-black/[0.01]"
-                  onClick={handleOpenModal}
-                >
-                  <img
-                    src="/logo_black.png"
-                    alt=""
-                    className="w-12 h-12 object-contain opacity-20 group-hover:opacity-40 group-hover:scale-110 transition-all duration-300"
-                  />
-                  <span className="text-sm text-black/35 group-hover:text-black/60 transition-colors duration-300">
-                    새 워크스페이스
-                  </span>
-                </button>
+              <div className="space-y-6">
+                {selectedCategoryId === null ? (
+                  // 전체 보기: 카테고리별 그룹화
+                  <>
+                    {categories.map((category) => {
+                      const categoryWorkspaces = workspaces.filter(ws =>
+                        workspaceCategoryMap[ws.id]?.includes(category.id)
+                      );
+                      const isDragOver = dragOverCategoryId === category.id;
+                      const showSection = categoryWorkspaces.length > 0 || isDragOver;
 
-                {/* Workspace Cards */}
-                {workspaces.map((workspace) => {
-                  // ACTIVE 멤버만 필터링
-                  const activeMembers = filterActiveMembers(workspace.members || []);
-                  const displayMembers = activeMembers.slice(0, 4);
-                  const remainingCount = activeMembers.length - 4;
+                      if (!showSection) return null;
 
-                  // 상대적 시간 계산
-                  const getRelativeTime = (dateString: string) => {
-                    const date = new Date(dateString);
-                    const now = new Date();
-                    const diffMs = now.getTime() - date.getTime();
-                    const diffMins = Math.floor(diffMs / 60000);
-                    const diffHours = Math.floor(diffMins / 60);
-                    const diffDays = Math.floor(diffHours / 24);
-
-                    if (diffMins < 1) return "방금 전";
-                    if (diffMins < 60) return `${diffMins}분 전`;
-                    if (diffHours < 24) return `${diffHours}시간 전`;
-                    if (diffDays < 7) return `${diffDays}일 전`;
-                    return date.toLocaleDateString("ko-KR");
-                  };
-
-                  return (
-                    <button
-                      key={workspace.id}
-                      className="group h-56 border border-black/10 hover:border-black/25 bg-white hover:shadow-lg transition-all duration-300 text-left p-7 flex flex-col justify-between"
-                      onClick={() => router.push(`/workspace/${workspace.id}`)}
-                    >
-                      <div>
-                        <h3 className="text-xl font-medium text-black mb-6">
-                          {workspace.name}
-                        </h3>
-
-                        {/* Member Avatars */}
-                        <div className="flex items-center">
-                          <div className="flex -space-x-2">
-                            {displayMembers.map((member, index) => {
-                              const presence = member.user ? presenceMap[member.user.id] : null;
-                              const status = presence?.status || member.user?.default_status || "offline";
-
-                              return (
-                                <div
-                                  key={member.id}
-                                  className="relative w-8 h-8 rounded-full border-2 border-white bg-black/10 flex items-center justify-center"
-                                  style={{ zIndex: displayMembers.length - index }}
-                                >
-                                  {member.user?.profile_img ? (
-                                    <img
-                                      src={member.user.profile_img}
-                                      alt={member.user.nickname}
-                                      className="w-full h-full rounded-full object-cover"
-                                    />
-                                  ) : (
-                                    <span className="text-xs font-medium text-black/50">
-                                      {member.user?.nickname?.charAt(0) || "?"}
-                                    </span>
-                                  )}
-                                  {/* Status Indicator for Member */}
-                                  {member.user && (
-                                    <StatusIndicator
-                                      status={status}
-                                      size="sm"
-                                      className="absolute bottom-0 right-0 ring-1 ring-white"
-                                    />
-                                  )}
+                      return (
+                        <div
+                          key={category.id}
+                          onDragOver={(e) => handleDragOver(e, category.id)}
+                          onDragLeave={handleDragLeave}
+                          onDrop={(e) => handleDrop(e, category.id)}
+                          className={`p-3 -m-3 transition-colors ${isDragOver ? "bg-white/5" : ""}`}
+                        >
+                          {/* Category Header */}
+                          <div className="flex items-center gap-2 mb-3">
+                            <span
+                              className="w-2 h-2 rounded-full"
+                              style={{ backgroundColor: category.color }}
+                            />
+                            <h3 className="text-sm font-medium text-white/70">
+                              {category.name}
+                            </h3>
+                            <span className="text-sm text-white/30">
+                              ({categoryWorkspaces.length})
+                            </span>
+                          </div>
+                          {/* Category Workspaces */}
+                          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
+                            {categoryWorkspaces.map((workspace) => (
+                              <WorkspaceCard
+                                key={workspace.id}
+                                workspace={workspace}
+                                categories={categories}
+                                workspaceCategoryMap={workspaceCategoryMap}
+                                draggingWorkspaceId={draggingWorkspaceId}
+                                onDragStart={handleDragStart}
+                                onDragEnd={handleDragEnd}
+                                onClick={() => router.push(`/workspace/${workspace.id}`)}
+                              />
+                            ))}
+                            {/* Skeleton placeholder */}
+                            {isDragOver && (
+                              <div className="p-5 bg-white/10 border-2 border-dashed border-white/20 animate-pulse">
+                                <div className="h-2 w-8 bg-white/20 mb-3" />
+                                <div className="h-4 w-24 bg-white/20 mb-1" />
+                                <div className="h-3 w-16 bg-white/10 mb-4" />
+                                <div className="flex -space-x-2">
+                                  <div className="w-7 h-7 rounded-full bg-white/10" />
+                                  <div className="w-7 h-7 rounded-full bg-white/10" />
                                 </div>
-                              )
-                            })}
-                            {remainingCount > 0 && (
-                              <div
-                                className="w-8 h-8 rounded-full border-2 border-white bg-black flex items-center justify-center"
-                                style={{ zIndex: 0 }}
-                              >
-                                <span className="text-xs font-medium text-white">
-                                  +{remainingCount}
-                                </span>
                               </div>
                             )}
                           </div>
                         </div>
-                      </div>
+                      );
+                    })}
 
-                      <div className="flex items-center justify-between">
-                        <span className="text-xs text-black/30">
-                          {getRelativeTime(workspace.created_at)}
-                        </span>
-                        <div className="w-8 h-8 rounded-full flex items-center justify-center group-hover:bg-black/5 transition-colors duration-300">
-                          <svg
-                            className="w-4 h-4 text-black/25 group-hover:text-black/50 group-hover:translate-x-0.5 transition-all duration-300"
-                            fill="none"
-                            stroke="currentColor"
-                            viewBox="0 0 24 24"
-                          >
-                            <path
-                              strokeLinecap="round"
-                              strokeLinejoin="round"
-                              strokeWidth={2}
-                              d="M9 5l7 7-7 7"
-                            />
-                          </svg>
+                    {/* 카테고리 없는 워크스페이스 (미분류) */}
+                    {(() => {
+                      const uncategorizedWorkspaces = workspaces.filter(ws =>
+                        !workspaceCategoryMap[ws.id] || workspaceCategoryMap[ws.id].length === 0
+                      );
+                      const isDragOver = dragOverCategoryId === "uncategorized";
+                      const showSection = uncategorizedWorkspaces.length > 0 || (draggingWorkspaceId && categories.length > 0);
+
+                      if (!showSection) return null;
+
+                      return (
+                        <div
+                          onDragOver={(e) => handleDragOver(e, "uncategorized")}
+                          onDragLeave={handleDragLeave}
+                          onDrop={(e) => handleDrop(e, "uncategorized")}
+                          className={`p-3 -m-3 transition-colors ${isDragOver ? "bg-white/5" : ""}`}
+                        >
+                          {categories.length > 0 && (
+                            <div className={`border-t mb-4 ${isDragOver ? "border-white/30" : "border-white/10"}`} />
+                          )}
+                          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
+                            {uncategorizedWorkspaces.map((workspace) => (
+                              <WorkspaceCard
+                                key={workspace.id}
+                                workspace={workspace}
+                                categories={categories}
+                                workspaceCategoryMap={workspaceCategoryMap}
+                                draggingWorkspaceId={draggingWorkspaceId}
+                                onDragStart={handleDragStart}
+                                onDragEnd={handleDragEnd}
+                                onClick={() => router.push(`/workspace/${workspace.id}`)}
+                              />
+                            ))}
+                            {/* Skeleton placeholder */}
+                            {isDragOver && (
+                              <div className="p-5 bg-white/10 border-2 border-dashed border-white/20 animate-pulse">
+                                <div className="h-4 w-24 bg-white/20 mb-1" />
+                                <div className="h-3 w-16 bg-white/10 mb-4" />
+                                <div className="flex -space-x-2">
+                                  <div className="w-7 h-7 rounded-full bg-white/10" />
+                                  <div className="w-7 h-7 rounded-full bg-white/10" />
+                                </div>
+                              </div>
+                            )}
+                          </div>
                         </div>
-                      </div>
-                    </button>
-                  );
-                })}
+                      );
+                    })()}
+                  </>
+                ) : (
+                  // 특정 카테고리 선택: 그리드
+                  <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
+                    {workspaces.map((workspace) => (
+                      <WorkspaceCard
+                        key={workspace.id}
+                        workspace={workspace}
+                        categories={categories}
+                        workspaceCategoryMap={workspaceCategoryMap}
+                        draggingWorkspaceId={draggingWorkspaceId}
+                        onDragStart={handleDragStart}
+                        onDragEnd={handleDragEnd}
+                        onClick={() => router.push(`/workspace/${workspace.id}`)}
+                      />
+                    ))}
+                  </div>
+                )}
+
+                {/* Infinite Scroll Trigger */}
+                <div ref={loadMoreRef} className="py-4">
+                  {isLoadingMore && (
+                    <div className="flex justify-center">
+                      <Loader2 size={20} className="animate-spin text-white/40" />
+                    </div>
+                  )}
+                  {!hasMore && workspaces.length > 0 && (
+                    <p className="text-center text-sm text-white/30">
+                      모든 워크스페이스를 불러왔습니다
+                    </p>
+                  )}
+                </div>
               </div>
             )}
-          </section>
-        </div>
-      </main>
+          </div>
+        </main>
+      </div>
 
-      {/* New Workspace Modal - 항상 렌더링하여 비디오 프리로드 */}
+      {/* Modal */}
       <div
-        className={`fixed inset-0 z-[100] flex transition-all duration-1000 ${showNewWorkspace
-          ? isClosingModal
-            ? 'translate-y-full'
-            : 'translate-y-0'
-          : 'translate-y-full pointer-events-none'
-          }`}
-        style={{ transitionTimingFunction: 'cubic-bezier(0.16, 1, 0.3, 1)' }}
+        className={`fixed inset-0 z-[100] flex transition-all duration-500 ${
+          showNewWorkspace
+            ? isClosingModal
+              ? 'opacity-0'
+              : 'opacity-100'
+            : 'opacity-0 pointer-events-none'
+        }`}
+        style={{ fontFamily: "'Cafe24ProSlim', sans-serif" }}
       >
-        {/* Left Side - Background Video */}
-        <div className="w-[70%] h-full relative overflow-hidden">
+        {/* Left - Video */}
+        <div className="hidden lg:block w-[55%] h-full relative overflow-hidden bg-[#1a1a1a]">
           <video
             ref={videoRef}
             src="/new-workspace-page-background-video.mov"
-            className="w-full h-full object-cover"
+            className="w-full h-full object-cover opacity-60"
             muted
             loop
             playsInline
             preload="auto"
           />
-          {/* Close Button */}
+          <div className="absolute inset-0 bg-gradient-to-r from-transparent via-transparent to-[#1a1a1a]" />
+
           <button
             onClick={handleCloseModal}
-            className="absolute top-8 left-8 w-10 h-10 flex items-center justify-center bg-black/30 backdrop-blur-sm rounded-full text-white/80 hover:bg-black/50 hover:text-white transition-all"
+            className="absolute top-8 left-8 text-white/60 hover:text-white transition-colors"
           >
-            <svg
-              className="w-5 h-5"
-              fill="none"
-              stroke="currentColor"
-              viewBox="0 0 24 24"
-            >
-              <path
-                strokeLinecap="round"
-                strokeLinejoin="round"
-                strokeWidth={2}
-                d="M6 18L18 6M6 6l12 12"
-              />
-            </svg>
+            <X size={24} />
           </button>
         </div>
 
-        {/* Right Side - Form */}
-        <div className="w-[30%] h-full bg-white flex flex-col justify-center px-12 border-l border-black/10">
-          <div className="w-full">
-            {/* Step Indicator */}
-            <div className="flex items-center gap-2 mb-6">
-              <div className={`w-2 h-2 rounded-full transition-colors ${createStep === 1 ? 'bg-black' : 'bg-black/20'}`} />
-              <div className={`w-2 h-2 rounded-full transition-colors ${createStep === 2 ? 'bg-black' : 'bg-black/20'}`} />
+        {/* Right - Form */}
+        <div className="w-full lg:w-[45%] h-full bg-[#1a1a1a] flex flex-col justify-center px-10 lg:px-16">
+          <button
+            onClick={handleCloseModal}
+            className="lg:hidden absolute top-8 right-8 text-white/60 hover:text-white transition-colors"
+          >
+            <X size={24} />
+          </button>
+
+          <div className="max-w-sm">
+            {/* Progress */}
+            <div className="flex gap-3 mb-12">
+              <div className={`h-[3px] w-10 rounded-full ${createStep >= 1 ? 'bg-white' : 'bg-white/20'}`} />
+              <div className={`h-[3px] w-10 rounded-full ${createStep >= 2 ? 'bg-white' : 'bg-white/20'}`} />
             </div>
 
-            {/* Step 1: 워크스페이스 이름 */}
             {createStep === 1 && (
-              <>
-                <p className="text-xs text-black/60 uppercase tracking-[0.2em] mb-2">
-                  STEP 1
-                </p>
-                <h2 className="text-2xl font-medium text-black mb-8">
-                  워크스페이스 이름
-                </h2>
-
-                <div className="space-y-12">
-                  <div>
-                    <input
-                      type="text"
-                      value={newWorkspaceName}
-                      onChange={(e) => setNewWorkspaceName(e.target.value)}
-                      placeholder="이름 입력"
-                      className="no-focus-outline w-full py-3 text-lg text-black border-x-0 border-t-0 border-b border-black/10 bg-transparent placeholder:text-black/50"
-                      autoFocus
-                    />
-                  </div>
-
-                  {/* Next Button */}
-                  <button
-                    onClick={handleNextStep}
-                    disabled={!newWorkspaceName.trim()}
-                    className={`group flex items-center gap-3 transition-all duration-300 ${newWorkspaceName.trim()
-                      ? 'text-black cursor-pointer'
-                      : 'text-black/40 cursor-not-allowed'
-                      }`}
-                  >
-                    <span className="text-sm font-medium tracking-wide">다음</span>
-                    <div className={`w-8 h-8 rounded-full border flex items-center justify-center transition-all duration-300 ${newWorkspaceName.trim()
-                      ? 'border-black group-hover:bg-black group-hover:text-white'
-                      : 'border-black/40'
-                      }`}>
-                      <svg
-                        className={`w-4 h-4 transition-transform duration-300 ${newWorkspaceName.trim() ? 'group-hover:translate-x-0.5' : ''}`}
-                        fill="none"
-                        stroke="currentColor"
-                        viewBox="0 0 24 24"
-                      >
-                        <path
-                          strokeLinecap="round"
-                          strokeLinejoin="round"
-                          strokeWidth={1.5}
-                          d="M9 5l7 7-7 7"
-                        />
-                      </svg>
-                    </div>
-                  </button>
+              <div className="space-y-12">
+                <div className="space-y-3">
+                  <p className="text-sm text-white/50 uppercase tracking-[0.15em]">Step 01</p>
+                  <h2 className="text-3xl font-bold text-white">워크스페이스 이름</h2>
                 </div>
-              </>
+
+                <input
+                  type="text"
+                  value={newWorkspaceName}
+                  onChange={(e) => setNewWorkspaceName(e.target.value)}
+                  placeholder="이름 입력"
+                  className="w-full bg-transparent border-b-2 border-white/20 focus:border-white/60 py-4 text-xl text-white placeholder:text-white/30 outline-none transition-colors"
+                  autoFocus
+                />
+
+                <button
+                  onClick={handleNextStep}
+                  disabled={!newWorkspaceName.trim()}
+                  className={`flex items-center gap-3 text-base transition-all ${
+                    newWorkspaceName.trim()
+                      ? 'text-white hover:gap-4'
+                      : 'text-white/30 cursor-not-allowed'
+                  }`}
+                >
+                  <span>다음</span>
+                  <ArrowRight size={18} />
+                </button>
+              </div>
             )}
 
-            {/* Step 2: 멤버 초대 */}
             {createStep === 2 && (
-              <>
-                <p className="text-xs text-black/60 uppercase tracking-[0.2em] mb-2">
-                  STEP 2
-                </p>
-                <h2 className="text-2xl font-medium text-black mb-2">
-                  멤버 초대
-                </h2>
-                <p className="text-sm text-black/60 mb-6">
-                  이름 또는 이메일로 검색하세요
-                </p>
+              <div className="space-y-10">
+                <div className="space-y-3">
+                  <p className="text-sm text-white/50 uppercase tracking-[0.15em]">Step 02</p>
+                  <h2 className="text-3xl font-bold text-white">멤버 초대</h2>
+                  <p className="text-base text-white/50">선택사항</p>
+                </div>
 
-                <div className="space-y-6">
-                  {/* Selected Members - 상단에 표시 */}
-                  {selectedMembers.length > 0 && (
-                    <div className="space-y-2">
-                      <p className="text-xs text-black/40 uppercase tracking-wider">
-                        초대할 멤버 ({selectedMembers.length})
-                      </p>
-                      <div className="flex flex-wrap gap-2">
-                        {selectedMembers.map((member) => (
-                          <div
-                            key={member.id}
-                            className="flex items-center gap-2 bg-black/5 rounded-full pl-1 pr-2 py-1"
-                          >
-                            {member.profile_img ? (
-                              <img
-                                src={member.profile_img}
-                                alt={member.nickname}
-                                className="w-6 h-6 rounded-full object-cover"
-                              />
-                            ) : (
-                              <div className="w-6 h-6 rounded-full bg-gradient-to-br from-black/20 to-black/10 flex items-center justify-center">
-                                <span className="text-[10px] font-medium text-black/60">
-                                  {member.nickname.charAt(0).toUpperCase()}
-                                </span>
-                              </div>
-                            )}
-                            <span className="text-sm text-black/70">
-                              {member.nickname}
-                            </span>
-                            <button
-                              onClick={() => handleRemoveMember(member.id)}
-                              className="w-4 h-4 rounded-full hover:bg-black/10 flex items-center justify-center transition-colors"
-                            >
-                              <svg
-                                className="w-3 h-3 text-black/40"
-                                fill="none"
-                                stroke="currentColor"
-                                viewBox="0 0 24 24"
-                              >
-                                <path
-                                  strokeLinecap="round"
-                                  strokeLinejoin="round"
-                                  strokeWidth={2}
-                                  d="M6 18L18 6M6 6l12 12"
-                                />
-                              </svg>
-                            </button>
+                {/* Selected */}
+                {selectedMembers.length > 0 && (
+                  <div className="flex flex-wrap gap-2">
+                    {selectedMembers.map((member) => (
+                      <div
+                        key={member.id}
+                        className="flex items-center gap-2 bg-white/10 rounded-full py-1.5 pl-1.5 pr-3"
+                      >
+                        {member.profile_img ? (
+                          <img src={member.profile_img} alt="" className="w-6 h-6 rounded-full object-cover" />
+                        ) : (
+                          <div className="w-6 h-6 rounded-full bg-white/20 flex items-center justify-center">
+                            <span className="text-[10px] text-white/70">{member.nickname.charAt(0)}</span>
                           </div>
-                        ))}
+                        )}
+                        <span className="text-sm text-white/80">{member.nickname}</span>
+                        <button onClick={() => handleRemoveMember(member.id)} className="ml-1">
+                          <X size={12} className="text-white/40 hover:text-white" />
+                        </button>
                       </div>
-                    </div>
+                    ))}
+                  </div>
+                )}
+
+                {/* Search */}
+                <div className="relative">
+                  <Search size={16} className="absolute left-0 top-1/2 -translate-y-1/2 text-white/40" />
+                  <input
+                    type="text"
+                    value={searchQuery}
+                    onChange={(e) => setSearchQuery(e.target.value)}
+                    placeholder="이름 또는 이메일 검색"
+                    className="w-full bg-transparent border-b-2 border-white/20 focus:border-white/60 py-4 pl-7 text-base text-white placeholder:text-white/30 outline-none transition-colors"
+                  />
+                  {isSearching && (
+                    <Loader2 size={14} className="absolute right-0 top-1/2 -translate-y-1/2 animate-spin text-white/50" />
                   )}
 
-                  {/* Search Input with Dropdown */}
-                  <div className="relative">
-                    <input
-                      type="text"
-                      value={searchQuery}
-                      onChange={(e) => setSearchQuery(e.target.value)}
-                      placeholder="이름 또는 이메일로 검색..."
-                      className="no-focus-outline w-full py-3 pl-10 pr-10 text-base text-black border border-black/10 bg-white placeholder:text-black/30 rounded-lg"
-                      autoFocus
-                    />
-                    <svg
-                      className="absolute left-3 top-1/2 -translate-y-1/2 w-5 h-5 text-black/30"
-                      fill="none"
-                      stroke="currentColor"
-                      viewBox="0 0 24 24"
-                    >
-                      <path
-                        strokeLinecap="round"
-                        strokeLinejoin="round"
-                        strokeWidth={1.5}
-                        d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z"
-                      />
-                    </svg>
-                    {isSearching && (
-                      <div className="absolute right-3 top-1/2 -translate-y-1/2">
-                        <div className="w-4 h-4 border-2 border-black/20 border-t-black/60 rounded-full animate-spin" />
-                      </div>
-                    )}
-
-                    {/* Dropdown Results */}
-                    {(searchResults.length > 0 || (searchQuery.length >= 2 && !isSearching)) && (
-                      <div className="absolute top-full left-0 right-0 mt-1 bg-white border border-black/10 rounded-lg shadow-lg overflow-hidden z-10">
-                        {searchResults.length > 0 ? (
-                          <div className="max-h-48 overflow-y-auto">
-                            {searchResults.map((result) => (
-                              <button
-                                key={result.id}
-                                onClick={() => handleAddMember(result)}
-                                className="w-full flex items-center gap-3 p-3 hover:bg-black/5 transition-colors text-left border-b border-black/5 last:border-b-0"
-                              >
-                                {result.profile_img ? (
-                                  <img
-                                    src={result.profile_img}
-                                    alt={result.nickname}
-                                    className="w-9 h-9 rounded-full object-cover"
-                                  />
-                                ) : (
-                                  <div className="w-9 h-9 rounded-full bg-gradient-to-br from-black/20 to-black/10 flex items-center justify-center">
-                                    <span className="text-sm font-medium text-black/60">
-                                      {result.nickname.charAt(0).toUpperCase()}
-                                    </span>
-                                  </div>
-                                )}
-                                <div className="flex-1 min-w-0">
-                                  <p className="text-sm font-medium text-black truncate">
-                                    {result.nickname}
-                                  </p>
-                                  <p className="text-xs text-black/40 truncate">
-                                    {result.email}
-                                  </p>
-                                </div>
-                                <div className="w-6 h-6 rounded-full bg-black/5 flex items-center justify-center">
-                                  <svg
-                                    className="w-4 h-4 text-black/40"
-                                    fill="none"
-                                    stroke="currentColor"
-                                    viewBox="0 0 24 24"
-                                  >
-                                    <path
-                                      strokeLinecap="round"
-                                      strokeLinejoin="round"
-                                      strokeWidth={2}
-                                      d="M12 4v16m8-8H4"
-                                    />
-                                  </svg>
-                                </div>
-                              </button>
-                            ))}
+                  {searchResults.length > 0 && (
+                    <div className="absolute top-full left-0 right-0 mt-2 bg-[#252525] border border-white/10 rounded-xl overflow-hidden">
+                      {searchResults.map((result) => (
+                        <button
+                          key={result.id}
+                          onClick={() => handleAddMember(result)}
+                          className="w-full flex items-center gap-3 p-4 hover:bg-white/5 transition-colors text-left"
+                        >
+                          {result.profile_img ? (
+                            <img src={result.profile_img} alt="" className="w-8 h-8 rounded-full object-cover" />
+                          ) : (
+                            <div className="w-8 h-8 rounded-full bg-white/20 flex items-center justify-center">
+                              <span className="text-sm text-white/70">{result.nickname.charAt(0)}</span>
+                            </div>
+                          )}
+                          <div>
+                            <p className="text-base text-white">{result.nickname}</p>
+                            <p className="text-sm text-white/50">{result.email}</p>
                           </div>
-                        ) : (
-                          <div className="p-4 text-center">
-                            <p className="text-sm text-black/40">검색 결과가 없습니다</p>
-                          </div>
-                        )}
-                      </div>
-                    )}
-                  </div>
-
-                  {/* Action Buttons */}
-                  <div className="flex items-center justify-between pt-4">
-                    {/* Back Button */}
-                    <button
-                      onClick={handlePrevStep}
-                      className="group flex items-center gap-2 text-black/50 hover:text-black transition-colors"
-                    >
-                      <svg
-                        className="w-4 h-4 group-hover:-translate-x-0.5 transition-transform"
-                        fill="none"
-                        stroke="currentColor"
-                        viewBox="0 0 24 24"
-                      >
-                        <path
-                          strokeLinecap="round"
-                          strokeLinejoin="round"
-                          strokeWidth={1.5}
-                          d="M15 19l-7-7 7-7"
-                        />
-                      </svg>
-                      <span className="text-sm">이전</span>
-                    </button>
-
-                    {/* Create / Skip Button */}
-                    <button
-                      onClick={handleCreateWorkspace}
-                      disabled={isCreating}
-                      className={`group flex items-center gap-3 ${isCreating ? 'text-black/40 cursor-not-allowed' : 'text-black'}`}
-                    >
-                      <span className="text-sm font-medium tracking-wide">
-                        {isCreating ? '생성 중...' : selectedMembers.length > 0 ? '완료' : '건너뛰기'}
-                      </span>
-                      <div className={`w-8 h-8 rounded-full border flex items-center justify-center transition-all duration-300 ${isCreating ? 'border-black/20' : 'border-black group-hover:bg-black group-hover:text-white'}`}>
-                        {isCreating ? (
-                          <div className="w-4 h-4 border-2 border-black/20 border-t-black/60 rounded-full animate-spin" />
-                        ) : (
-                          <svg
-                            className="w-4 h-4 group-hover:translate-x-0.5 transition-transform duration-300"
-                            fill="none"
-                            stroke="currentColor"
-                            viewBox="0 0 24 24"
-                          >
-                            <path
-                              strokeLinecap="round"
-                              strokeLinejoin="round"
-                              strokeWidth={1.5}
-                              d="M9 5l7 7-7 7"
-                            />
-                          </svg>
-                        )}
-                      </div>
-                    </button>
-                  </div>
+                        </button>
+                      ))}
+                    </div>
+                  )}
                 </div>
-              </>
+
+                {/* Actions */}
+                <div className="flex items-center justify-between pt-4">
+                  <button
+                    onClick={handlePrevStep}
+                    className="flex items-center gap-2 text-base text-white/50 hover:text-white transition-colors"
+                  >
+                    <ArrowLeft size={18} />
+                    <span>이전</span>
+                  </button>
+
+                  <button
+                    onClick={handleCreateWorkspace}
+                    disabled={isCreating}
+                    className="flex items-center gap-3 text-base text-white hover:gap-4 transition-all disabled:text-white/40"
+                  >
+                    <span>{isCreating ? '생성 중...' : '완료'}</span>
+                    {isCreating ? (
+                      <Loader2 size={18} className="animate-spin" />
+                    ) : (
+                      <ArrowRight size={18} />
+                    )}
+                  </button>
+                </div>
+              </div>
             )}
           </div>
         </div>
       </div>
+
+      {/* Category Modal */}
+      {showCategoryModal && (
+        <div className="fixed inset-0 z-[100] flex items-center justify-center p-4">
+          <div
+            className="absolute inset-0 bg-black/50"
+            onClick={() => {
+              setShowCategoryModal(false);
+              setEditingCategory(null);
+              setNewCategoryName("");
+              setNewCategoryColor("#6366f1");
+            }}
+          />
+
+          <div className="bg-[#222] w-full max-w-xs relative z-10">
+            <div className="p-5 space-y-4">
+              <input
+                type="text"
+                value={newCategoryName}
+                onChange={(e) => setNewCategoryName(e.target.value)}
+                placeholder="카테고리 이름"
+                className="w-full bg-transparent border-b border-white/20 focus:border-white/50 py-2 text-white placeholder:text-white/30 outline-none transition-colors"
+                autoFocus
+              />
+
+              <div className="flex gap-1.5">
+                {["#737373", "#a3a3a3", "#6366f1", "#22c55e", "#ef4444", "#f97316"].map((color) => (
+                  <button
+                    key={color}
+                    onClick={() => setNewCategoryColor(color)}
+                    className={`w-6 h-6 ${newCategoryColor === color ? "ring-1 ring-white" : ""}`}
+                    style={{ backgroundColor: color }}
+                  />
+                ))}
+              </div>
+            </div>
+
+            <div className="flex border-t border-white/10">
+              <button
+                onClick={() => {
+                  setShowCategoryModal(false);
+                  setEditingCategory(null);
+                  setNewCategoryName("");
+                  setNewCategoryColor("#6366f1");
+                }}
+                className="flex-1 py-3 text-sm text-white/50 hover:text-white hover:bg-white/5 transition-colors"
+              >
+                취소
+              </button>
+              <button
+                onClick={editingCategory ? handleUpdateCategory : handleCreateCategory}
+                disabled={!newCategoryName.trim() || isCreatingCategory}
+                className="flex-1 py-3 text-sm text-white hover:bg-white/5 transition-colors disabled:opacity-30 disabled:cursor-not-allowed"
+              >
+                {isCreatingCategory ? "..." : (editingCategory ? "수정" : "생성")}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
