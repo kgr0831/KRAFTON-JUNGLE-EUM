@@ -3,6 +3,7 @@ package aws
 import (
 	"context"
 	"log"
+	"strings"
 	"sync"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -23,11 +24,47 @@ type TranslationResult struct {
 }
 
 // Translate 언어 코드 매핑 (Amazon Translate는 ISO 639-1 사용)
+// AWS Translate supports these primary codes
 var translateLanguageCodes = map[string]string{
 	"ko": "ko",
 	"en": "en",
 	"ja": "ja",
 	"zh": "zh",
+	// Aliases for common variations
+	"ko-KR": "ko",
+	"en-US": "en",
+	"en-GB": "en",
+	"ja-JP": "ja",
+	"zh-CN": "zh",
+	"zh-TW": "zh",
+}
+
+// supportedTargetLanguages is a set of valid target languages
+var supportedTargetLanguages = map[string]bool{
+	"ko": true,
+	"en": true,
+	"ja": true,
+	"zh": true,
+}
+
+// normalizeLanguageCode normalizes a language code to a supported format
+func normalizeLanguageCode(lang string) string {
+	// First check if it's already in the map
+	if code, ok := translateLanguageCodes[lang]; ok {
+		return code
+	}
+	// Try lowercase
+	if code, ok := translateLanguageCodes[strings.ToLower(lang)]; ok {
+		return code
+	}
+	// Try just the first 2 characters
+	if len(lang) >= 2 {
+		short := strings.ToLower(lang[:2])
+		if code, ok := translateLanguageCodes[short]; ok {
+			return code
+		}
+	}
+	return ""
 }
 
 // NewTranslateClient creates a new Translate client
@@ -39,12 +76,32 @@ func NewTranslateClient(cfg aws.Config) *TranslateClient {
 
 // Translate translates text from source to target language
 func (c *TranslateClient) Translate(ctx context.Context, text, sourceLang, targetLang string) (*TranslationResult, error) {
+	// Normalize language codes
+	srcCode := normalizeLanguageCode(sourceLang)
+	tgtCode := normalizeLanguageCode(targetLang)
+
+	// Validate and fix invalid language codes
+	if srcCode == "" {
+		log.Printf("[Translate] ⚠️ Unknown source language '%s', defaulting to 'ko'", sourceLang)
+		srcCode = "ko"
+	}
+	if tgtCode == "" {
+		log.Printf("[Translate] ⚠️ Unknown target language '%s', defaulting to 'en'", targetLang)
+		tgtCode = "en"
+	}
+
+	// Validate target is a supported language (prevent German, Spanish, etc.)
+	if !supportedTargetLanguages[tgtCode] {
+		log.Printf("[Translate] ⚠️ Unsupported target language '%s' (normalized from '%s'), defaulting to 'en'", tgtCode, targetLang)
+		tgtCode = "en"
+	}
+
 	// Skip if same language
-	if sourceLang == targetLang {
+	if srcCode == tgtCode {
 		return &TranslationResult{
 			SourceText:     text,
-			SourceLanguage: sourceLang,
-			TargetLanguage: targetLang,
+			SourceLanguage: srcCode,
+			TargetLanguage: tgtCode,
 			TranslatedText: text,
 		}, nil
 	}
@@ -53,20 +110,10 @@ func (c *TranslateClient) Translate(ctx context.Context, text, sourceLang, targe
 	if text == "" {
 		return &TranslationResult{
 			SourceText:     text,
-			SourceLanguage: sourceLang,
-			TargetLanguage: targetLang,
+			SourceLanguage: srcCode,
+			TargetLanguage: tgtCode,
 			TranslatedText: text,
 		}, nil
-	}
-
-	srcCode := translateLanguageCodes[sourceLang]
-	if srcCode == "" {
-		srcCode = "en"
-	}
-
-	tgtCode := translateLanguageCodes[targetLang]
-	if tgtCode == "" {
-		tgtCode = "en"
 	}
 
 	input := &translate.TranslateTextInput{
@@ -75,17 +122,22 @@ func (c *TranslateClient) Translate(ctx context.Context, text, sourceLang, targe
 		TargetLanguageCode: aws.String(tgtCode),
 	}
 
+	log.Printf("[Translate] Translating: '%s' from %s to %s", text, srcCode, tgtCode)
+
 	output, err := c.client.TranslateText(ctx, input)
 	if err != nil {
-		log.Printf("[Translate] Error translating from %s to %s: %v", sourceLang, targetLang, err)
+		log.Printf("[Translate] ❌ Error translating from %s to %s: %v", srcCode, tgtCode, err)
 		return nil, err
 	}
 
+	result := aws.ToString(output.TranslatedText)
+	log.Printf("[Translate] ✅ Result: '%s' → '%s' (%s→%s)", text, result, srcCode, tgtCode)
+
 	return &TranslationResult{
 		SourceText:     text,
-		SourceLanguage: sourceLang,
-		TargetLanguage: targetLang,
-		TranslatedText: aws.ToString(output.TranslatedText),
+		SourceLanguage: srcCode,
+		TargetLanguage: tgtCode,
+		TranslatedText: result,
 	}, nil
 }
 

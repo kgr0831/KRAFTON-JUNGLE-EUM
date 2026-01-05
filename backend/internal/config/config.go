@@ -23,10 +23,11 @@ type Config struct {
 	Redis     RedisConfig
 }
 
-// RedisConfig Redis 설정
+// RedisConfig ElastiCache/Valkey 설정
 type RedisConfig struct {
 	Addr     string
 	Password string
+	Enabled  bool
 	DB       int
 }
 
@@ -153,8 +154,9 @@ func Load() *Config {
 			APISecret: getEnv("LIVEKIT_API_SECRET", "secret"),
 		},
 		Redis: RedisConfig{
-			Addr:     getEnv("REDIS_ADDR", "localhost:6379"),
+			Addr:     getEnv("REDIS_ADDR", ""),
 			Password: getEnv("REDIS_PASSWORD", ""),
+			Enabled:  getBool("REDIS_ENABLED", false),
 			DB:       getInt("REDIS_DB", 0),
 		},
 	}

@@ -16,6 +16,9 @@ interface ParticipantChannel {
     sourceNode: AudioBufferSourceNode | null;
     isPlaying: boolean;
     lastPlayTime: number;
+    // 순차 재생을 위한 큐
+    audioQueue: Array<{ audioData: ArrayBuffer; sampleRate?: number }>;
+    isProcessingQueue: boolean;
 }
 
 interface UseAudioPlaybackReturn {
@@ -91,6 +94,8 @@ export function useAudioPlayback({
             sourceNode: null,
             isPlaying: false,
             lastPlayTime: Date.now(),
+            audioQueue: [],
+            isProcessingQueue: false,
         };
 
         channelsRef.current.set(participantId, channel);
@@ -312,15 +317,45 @@ export function useAudioPlayback({
         updateActiveCount();
     }, [updateActiveCount]);
 
-    // 레거시 호환성: queueAudio (이제 즉시 재생)
-    const queueAudio = useCallback((audioData: ArrayBuffer, sampleRate?: number, participantId?: string) => {
-        // 병렬 재생이므로 큐 없이 즉시 재생
-        if (sampleRate !== undefined) {
-            playPCMAudio(audioData, sampleRate, participantId);
-        } else {
-            playAudio(audioData, participantId);
+    // 큐에서 다음 오디오 처리
+    const processQueue = useCallback(async (participantId: string) => {
+        const channel = channelsRef.current.get(participantId);
+        if (!channel || channel.isProcessingQueue) return;
+
+        channel.isProcessingQueue = true;
+
+        while (channel.audioQueue.length > 0) {
+            const item = channel.audioQueue.shift();
+            if (!item) break;
+
+            try {
+                if (item.sampleRate !== undefined) {
+                    await playPCMAudio(item.audioData, item.sampleRate, participantId);
+                } else {
+                    await playAudio(item.audioData, participantId);
+                }
+            } catch (e) {
+                console.error(`[AudioPlayback] Queue item failed for ${participantId}:`, e);
+            }
         }
+
+        channel.isProcessingQueue = false;
     }, [playAudio, playPCMAudio]);
+
+    // queueAudio: 순차 재생 큐에 추가
+    const queueAudio = useCallback((audioData: ArrayBuffer, sampleRate?: number, participantId?: string) => {
+        const pid = participantId || 'default';
+        const channel = getOrCreateChannel(pid);
+
+        // 큐에 추가
+        channel.audioQueue.push({ audioData: audioData.slice(0), sampleRate });
+        console.log(`[AudioPlayback] Queued audio for ${pid}, queue size: ${channel.audioQueue.length}`);
+
+        // 큐 처리 시작 (이미 처리 중이면 무시)
+        if (!channel.isProcessingQueue) {
+            processQueue(pid);
+        }
+    }, [getOrCreateChannel, processQueue]);
 
     // 주기적 채널 정리
     useEffect(() => {

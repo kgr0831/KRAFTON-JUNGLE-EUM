@@ -276,6 +276,25 @@ interface CreateVoiceRecordBulkRequest {
   records: CreateVoiceRecordRequest[];
 }
 
+// 실시간 음성 기록 (Redis 기반)
+interface RoomTranscript {
+  roomId: string;
+  speakerId: string;
+  speakerName: string;
+  original: string;
+  translated?: string;
+  sourceLang: string;
+  targetLang?: string;
+  isFinal: boolean;
+  timestamp: string;
+}
+
+interface RoomTranscriptsResponse {
+  roomId: string;
+  transcripts: RoomTranscript[];
+  count: number;
+}
+
 // HTTP-only 쿠키 기반 인증 (XSS 방지)
 class ApiClient {
   private isLoggedIn: boolean = false;
@@ -828,6 +847,11 @@ class ApiClient {
     );
   }
 
+  // 실시간 음성 기록 (Redis)
+  async getRoomTranscripts(roomId: string): Promise<RoomTranscriptsResponse> {
+    return this.request<RoomTranscriptsResponse>(`/api/room/${encodeURIComponent(roomId)}/transcripts`);
+  }
+
   async createVoiceRecord(workspaceId: number, meetingId: number, data: CreateVoiceRecordRequest): Promise<VoiceRecord> {
     return this.request<VoiceRecord>(`/api/workspaces/${workspaceId}/meetings/${meetingId}/voice-records`, {
       method: 'POST',
@@ -887,4 +911,7 @@ export type {
   VoiceRecord,
   VoiceRecordsResponse,
   CreateVoiceRecordRequest,
+  // Room Transcript (Redis)
+  RoomTranscript,
+  RoomTranscriptsResponse,
 };

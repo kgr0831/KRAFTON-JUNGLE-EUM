@@ -182,14 +182,15 @@ func (ChatLog) TableName() string {
 
 // VoiceRecord 음성 기록 (STT 결과)
 type VoiceRecord struct {
-	ID          int64     `gorm:"primaryKey;autoIncrement" json:"id"`
-	MeetingID   int64     `gorm:"not null;index" json:"meeting_id"`
-	SpeakerID   *int64    `json:"speaker_id,omitempty"`
-	SpeakerName string    `gorm:"type:varchar(100)" json:"speaker_name"`
-	Original    string    `gorm:"type:text;not null" json:"original"`            // STT 원본 텍스트
-	Translated  *string   `gorm:"type:text" json:"translated,omitempty"`         // 번역된 텍스트 (있는 경우)
-	TargetLang  *string   `gorm:"type:varchar(10)" json:"target_lang,omitempty"` // 번역 대상 언어
-	CreatedAt   time.Time `gorm:"autoCreateTime;index" json:"created_at"`
+	ID            int64     `gorm:"primaryKey;autoIncrement" json:"id"`
+	MeetingID     int64     `gorm:"not null;index" json:"meeting_id"`
+	SpeakerID     *int64    `json:"speaker_id,omitempty"`
+	SpeakerName   string    `gorm:"type:varchar(100)" json:"speaker_name"`
+	Original      string    `gorm:"type:text;not null" json:"original"`            // STT 원본 텍스트
+	Translated    *string   `gorm:"type:text" json:"translated,omitempty"`         // 번역된 텍스트 (있는 경우)
+	SourceLang    *string   `gorm:"type:varchar(10)" json:"source_lang,omitempty"` // 원본 언어 (ko, en, ja, zh)
+	TargetLang    *string   `gorm:"type:varchar(10)" json:"target_lang,omitempty"` // 번역 대상 언어
+	CreatedAt     time.Time `gorm:"autoCreateTime;index" json:"created_at"`
 
 	// Relations
 	Meeting Meeting `gorm:"foreignKey:MeetingID" json:"meeting,omitempty"`
