@@ -24,13 +24,14 @@ import (
 
 // RoomHub manages all rooms and their connections
 type RoomHub struct {
-	rooms       map[string]*Room
-	mu          sync.RWMutex
-	aiClient    *ai.GrpcClient     // Python gRPC 클라이언트
-	useAWS      bool               // AWS 직접 사용 여부
-	cfg         *config.Config     // 앱 설정
-	redisClient *cache.RedisClient // Redis/Valkey 클라이언트
-	db          *gorm.DB           // Database for saving transcripts
+	rooms         map[string]*Room
+	mu            sync.RWMutex
+	aiClient      *ai.GrpcClient        // Python gRPC 클라이언트
+	useAWS        bool                  // AWS 직접 사용 여부
+	cfg           *config.Config        // 앱 설정
+	redisClient   *cache.RedisClient    // Redis/Valkey 클라이언트
+	db            *gorm.DB              // Database for saving transcripts
+	awsClientPool *awsai.AWSClientPool  // 공유 AWS 클라이언트 풀
 }
 
 // Room represents a single room with listeners and speakers
@@ -92,13 +93,29 @@ type TranscriptData struct {
 
 // NewRoomHub creates a new RoomHub instance
 func NewRoomHub(aiClient *ai.GrpcClient, cfg *config.Config, useAWS bool, redisClient *cache.RedisClient) *RoomHub {
-	return &RoomHub{
+	hub := &RoomHub{
 		rooms:       make(map[string]*Room),
 		aiClient:    aiClient,
 		cfg:         cfg,
 		useAWS:      useAWS,
 		redisClient: redisClient,
 	}
+
+	// Initialize shared AWS client pool if using AWS
+	if useAWS && cfg != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+
+		clientPool, err := awsai.NewAWSClientPool(ctx, cfg, awsai.DefaultAWSClientPoolConfig())
+		if err != nil {
+			log.Printf("[RoomHub] ⚠️ Failed to create AWS client pool: %v (will create clients per room)", err)
+		} else {
+			hub.awsClientPool = clientPool
+			log.Printf("[RoomHub] ✅ AWS client pool initialized")
+		}
+	}
+
+	return hub
 }
 
 // SetDB sets the database connection for saving transcripts
@@ -645,14 +662,33 @@ func (r *Room) startAWSPipeline() error {
 	}
 
 	pipelineCfg := &awsai.PipelineConfig{
-		TargetLanguages: targetLangs,
-		SampleRate:      16000,
+		TargetLanguages:  targetLangs,
+		SampleRate:       16000,
+		UseStreamManager: true, // Enable language-based stream pooling
+		UseWorkerPools:   true, // Enable worker pools for translation/TTS
 	}
 
-	pipeline, err := awsai.NewPipeline(r.ctx, r.hub.cfg, pipelineCfg)
-	if err != nil {
-		log.Printf("[Room %s] Failed to create AWS pipeline: %v", r.ID, err)
-		return err
+	var pipeline *awsai.Pipeline
+	var err error
+
+	// Use shared client pool if available
+	if r.hub.awsClientPool != nil {
+		pipeline, err = awsai.NewPipelineWithClientPool(r.ctx, r.hub.awsClientPool, pipelineCfg)
+		if err != nil {
+			log.Printf("[Room %s] Failed to create AWS pipeline with client pool: %v", r.ID, err)
+			return err
+		}
+		log.Printf("[Room %s] AWS pipeline started with shared client pool (targets: %v)", r.ID, targetLangs)
+	} else {
+		// Fallback to legacy mode (create clients per room)
+		pipelineCfg.UseStreamManager = false // Disable new features for legacy mode
+		pipelineCfg.UseWorkerPools = false
+		pipeline, err = awsai.NewPipeline(r.ctx, r.hub.cfg, pipelineCfg)
+		if err != nil {
+			log.Printf("[Room %s] Failed to create AWS pipeline: %v", r.ID, err)
+			return err
+		}
+		log.Printf("[Room %s] AWS pipeline started in legacy mode (targets: %v)", r.ID, targetLangs)
 	}
 
 	r.mu.Lock()
@@ -662,7 +698,6 @@ func (r *Room) startAWSPipeline() error {
 	// Start receiving responses from AWS pipeline
 	go r.receiveAWSResponses()
 
-	log.Printf("[Room %s] AWS pipeline started with targets: %v", r.ID, targetLangs)
 	return nil
 }
 
@@ -938,4 +973,37 @@ func (h *RoomHub) CleanupInactiveRooms(maxAge time.Duration) {
 			log.Printf("[RoomHub] Cleaned up inactive room: %s", roomID)
 		}
 	}
+}
+
+// Close shuts down the RoomHub and cleans up all resources
+func (h *RoomHub) Close() {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	// Shutdown all rooms
+	for roomID, room := range h.rooms {
+		room.Shutdown()
+		delete(h.rooms, roomID)
+	}
+
+	// Close the shared AWS client pool
+	if h.awsClientPool != nil {
+		h.awsClientPool.Close()
+		h.awsClientPool = nil
+		log.Printf("[RoomHub] AWS client pool closed")
+	}
+
+	log.Printf("[RoomHub] Shutdown complete")
+}
+
+// GetClientPoolStats returns statistics about the shared AWS client pool
+func (h *RoomHub) GetClientPoolStats() map[string]interface{} {
+	if h.awsClientPool == nil {
+		return map[string]interface{}{
+			"available": false,
+		}
+	}
+	stats := h.awsClientPool.Stats()
+	stats["available"] = true
+	return stats
 }

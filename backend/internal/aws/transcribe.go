@@ -26,10 +26,9 @@ const (
 
 // TranscribeClient wraps Amazon Transcribe Streaming with resilience features
 type TranscribeClient struct {
-	client         *transcribestreaming.Client
-	sampleRate     int32
-	circuitBreaker *CircuitBreaker
-	awsConfig      aws.Config
+	client     *transcribestreaming.Client
+	sampleRate int32
+	awsConfig  aws.Config
 }
 
 // StreamStatus represents the health status of a stream
@@ -126,13 +125,6 @@ func NewTranscribeClient(cfg aws.Config, sampleRate int32) *TranscribeClient {
 		client:     transcribestreaming.NewFromConfig(cfg),
 		sampleRate: sampleRate,
 		awsConfig:  cfg,
-		circuitBreaker: NewCircuitBreaker(&CircuitBreakerConfig{
-			Name:             "transcribe",
-			FailureThreshold: 5,
-			SuccessThreshold: 2,
-			CooldownPeriod:   30 * time.Second,
-			MaxHalfOpen:      2,
-		}),
 	}
 }
 
@@ -148,10 +140,25 @@ func (c *TranscribeClient) StartStream(ctx context.Context, speakerID, sourceLan
 
 	streamCtx, cancel := context.WithCancel(ctx)
 
+	// Start the transcription stream directly (no circuit breaker - AWS SDK handles retries)
+	resp, err := c.client.StartStreamTranscription(streamCtx, &transcribestreaming.StartStreamTranscriptionInput{
+		LanguageCode:                      langCode,
+		MediaEncoding:                     types.MediaEncodingPcm,
+		MediaSampleRateHertz:              aws.Int32(c.sampleRate),
+		EnablePartialResultsStabilization: true,                                 // Enable partial stabilization to reduce choppy updates
+		PartialResultsStability:           types.PartialResultsStabilityMedium, // Medium stability: balance between real-time and accuracy
+	})
+	if err != nil {
+		log.Printf("[Transcribe] ERROR StartStreamTranscription failed: %v", err)
+		cancel()
+		return nil, err
+	}
+
 	ts := &TranscribeStream{
 		speakerID:       speakerID,
 		sourceLang:      sourceLang,
 		client:          c,
+		eventStream:     resp.GetStream(),
 		ctx:             streamCtx,
 		cancel:          cancel,
 		parentCtx:       ctx,
@@ -164,29 +171,6 @@ func (c *TranscribeClient) StartStream(ctx context.Context, speakerID, sourceLan
 		status:          StreamStatusHealthy,
 		isClosed:        false,
 	}
-
-	// Start the transcription stream with circuit breaker
-	var eventStream *transcribestreaming.StartStreamTranscriptionEventStream
-	err := c.circuitBreaker.Execute(func() error {
-		resp, err := c.client.StartStreamTranscription(streamCtx, &transcribestreaming.StartStreamTranscriptionInput{
-			LanguageCode:         langCode,
-			MediaEncoding:        types.MediaEncodingPcm,
-			MediaSampleRateHertz: aws.Int32(c.sampleRate),
-		})
-		if err != nil {
-			return err
-		}
-		eventStream = resp.GetStream()
-		return nil
-	})
-
-	if err != nil {
-		log.Printf("[Transcribe] ERROR StartStreamTranscription failed: %v", err)
-		cancel()
-		return nil, err
-	}
-
-	ts.eventStream = eventStream
 
 	// Start goroutines with improved error handling
 	go ts.sendAudioLoop()
@@ -522,12 +506,6 @@ func (ts *TranscribeStream) shouldReconnect() bool {
 		return false
 	}
 
-	// Check circuit breaker
-	if ts.client.circuitBreaker.State() == StateOpen {
-		log.Printf("[Transcribe] Circuit breaker open for %s", ts.speakerID)
-		return false
-	}
-
 	return true
 }
 
@@ -577,27 +555,20 @@ func (ts *TranscribeStream) attemptReconnect() error {
 		langCode = types.LanguageCodeEnUs
 	}
 
-	// Start new stream with circuit breaker
-	var newEventStream *transcribestreaming.StartStreamTranscriptionEventStream
-	err := ts.client.circuitBreaker.Execute(func() error {
-		resp, err := ts.client.client.StartStreamTranscription(newCtx, &transcribestreaming.StartStreamTranscriptionInput{
-			LanguageCode:         langCode,
-			MediaEncoding:        types.MediaEncodingPcm,
-			MediaSampleRateHertz: aws.Int32(ts.client.sampleRate),
-		})
-		if err != nil {
-			return err
-		}
-		newEventStream = resp.GetStream()
-		return nil
+	// Start new stream directly (no circuit breaker - AWS SDK handles retries)
+	resp, err := ts.client.client.StartStreamTranscription(newCtx, &transcribestreaming.StartStreamTranscriptionInput{
+		LanguageCode:                      langCode,
+		MediaEncoding:                     types.MediaEncodingPcm,
+		MediaSampleRateHertz:              aws.Int32(ts.client.sampleRate),
+		EnablePartialResultsStabilization: true,                                 // Enable partial stabilization to reduce choppy updates
+		PartialResultsStability:           types.PartialResultsStabilityMedium, // Medium stability: balance between real-time and accuracy
 	})
-
 	if err != nil {
 		log.Printf("[Transcribe] Failed to start new stream for %s: %v", ts.speakerID, err)
 		return err
 	}
 
-	ts.eventStream = newEventStream
+	ts.eventStream = resp.GetStream()
 	ts.mu.Lock()
 	ts.streamStartTime = time.Now()
 	ts.lastSuccessTime = time.Now()
