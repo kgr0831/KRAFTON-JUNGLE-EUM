@@ -2,6 +2,7 @@ package aws
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"strings"
 	"sync"
@@ -52,12 +53,19 @@ type PipelineHealth struct {
 
 // Pipeline orchestrates STT -> Translate -> TTS flow using AWS services
 type Pipeline struct {
+	// Shared AWS clients (from client pool or created locally)
 	transcribe *TranscribeClient
 	translate  *TranslateClient
 	polly      *PollyClient
 	cache      *PipelineCache
 
-	// Per-speaker streams with last activity tracking
+	// Client pool reference (for shared clients mode)
+	clientPool *AWSClientPool
+
+	// Stream manager for language-based stream pooling
+	streamManager *StreamManager
+
+	// Per-speaker streams with last activity tracking (legacy mode)
 	speakerStreams   map[string]*TranscribeStream
 	streamLastActive map[string]time.Time
 	streamsMu        sync.RWMutex
@@ -82,9 +90,23 @@ type Pipeline struct {
 	// Backpressure control
 	backpressureActive int32 // atomic flag
 
-	// Semaphores for limiting concurrent API calls
+	// Worker pools for translation and TTS (replaces semaphores in shared mode)
+	translatePool *WorkerPool
+	ttsPool       *WorkerPool
+
+	// Semaphores for limiting concurrent API calls (legacy mode)
 	translateSem chan struct{}
 	ttsSem       chan struct{}
+
+	// Mode flags
+	useStreamManager bool // Use StreamManager for language-based pooling
+	useWorkerPools   bool // Use WorkerPool instead of semaphores
+
+	// Per-pipeline stream processors tracking (prevents collisions between pipelines)
+	streamProcessors sync.Map
+
+	// Lifecycle
+	closed int32 // atomic flag to prevent double-close panics
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -92,8 +114,10 @@ type Pipeline struct {
 
 // PipelineConfig configuration for pipeline
 type PipelineConfig struct {
-	TargetLanguages []string
-	SampleRate      int32
+	TargetLanguages  []string
+	SampleRate       int32
+	UseStreamManager bool // Enable language-based stream pooling
+	UseWorkerPools   bool // Enable worker pools for translation/TTS
 }
 
 // NewPipeline creates a new AWS AI pipeline
@@ -150,6 +174,74 @@ func NewPipeline(ctx context.Context, cfg *appconfig.Config, pipelineCfg *Pipeli
 	go pipeline.healthCheckLoop()
 
 	log.Printf("[AWS Pipeline] Pipeline initialized successfully")
+
+	return pipeline, nil
+}
+
+// NewPipelineWithClientPool creates a new AWS AI pipeline using shared clients from the client pool.
+// This is the recommended way to create a Pipeline when you want to share AWS connections across rooms.
+func NewPipelineWithClientPool(ctx context.Context, clientPool *AWSClientPool, pipelineCfg *PipelineConfig) (*Pipeline, error) {
+	if clientPool == nil {
+		return nil, fmt.Errorf("clientPool cannot be nil")
+	}
+
+	pCtx, cancel := context.WithCancel(ctx)
+
+	targetLangs := []string{"en"}
+	if pipelineCfg != nil && len(pipelineCfg.TargetLanguages) > 0 {
+		targetLangs = pipelineCfg.TargetLanguages
+	}
+
+	// Acquire reference to client pool
+	clientPool.Acquire()
+
+	pipeline := &Pipeline{
+		transcribe:       clientPool.Transcribe,
+		translate:        clientPool.Translate,
+		polly:            clientPool.Polly,
+		clientPool:       clientPool,
+		cache:            NewPipelineCache(DefaultCacheConfig()),
+		speakerStreams:   make(map[string]*TranscribeStream),
+		streamLastActive: make(map[string]time.Time),
+		TranscriptChan:   make(chan *ai.TranscriptMessage, 100),
+		AudioChan:        make(chan *ai.AudioMessage, 200),
+		ErrChan:          make(chan error, 20),
+		targetLanguages:  targetLangs,
+		startTime:        time.Now(),
+		status:           PipelineStatusHealthy,
+		translateSem:     make(chan struct{}, MaxConcurrentTranslate),
+		ttsSem:           make(chan struct{}, MaxConcurrentTTS),
+		useStreamManager: pipelineCfg != nil && pipelineCfg.UseStreamManager,
+		useWorkerPools:   pipelineCfg != nil && pipelineCfg.UseWorkerPools,
+		ctx:              pCtx,
+		cancel:           cancel,
+	}
+
+	// Initialize StreamManager for language-based pooling if enabled
+	if pipeline.useStreamManager {
+		pipeline.streamManager = NewStreamManager(pCtx, clientPool, DefaultStreamManagerConfig())
+		pipeline.streamManager.SetOnStreamDead(func(sourceLang string) {
+			log.Printf("[AWS Pipeline] Stream died for lang=%s, will recreate on next audio", sourceLang)
+		})
+		log.Printf("[AWS Pipeline] StreamManager enabled for language-based pooling")
+	}
+
+	// Initialize WorkerPools if enabled
+	if pipeline.useWorkerPools {
+		pipeline.translatePool = NewWorkerPool(pCtx, "translate", MaxConcurrentTranslate, 200)
+		pipeline.ttsPool = NewWorkerPool(pCtx, "tts", MaxConcurrentTTS, 100)
+		log.Printf("[AWS Pipeline] WorkerPools enabled (translate: %d workers, tts: %d workers)",
+			MaxConcurrentTranslate, MaxConcurrentTTS)
+	}
+
+	// Start background goroutines (only for legacy mode)
+	if !pipeline.useStreamManager {
+		go pipeline.streamTimeoutChecker()
+	}
+	go pipeline.healthCheckLoop()
+
+	log.Printf("[AWS Pipeline] Pipeline initialized with shared clients (streamManager=%v, workerPools=%v)",
+		pipeline.useStreamManager, pipeline.useWorkerPools)
 
 	return pipeline, nil
 }
@@ -344,6 +436,19 @@ func (p *Pipeline) ProcessAudio(speakerID, sourceLang, speakerName string, audio
 
 // getOrCreateStream gets existing or creates new Transcribe stream for speaker
 func (p *Pipeline) getOrCreateStream(speakerID, sourceLang string) (*TranscribeStream, error) {
+	// Use StreamManager for language-based pooling if enabled
+	if p.useStreamManager && p.streamManager != nil {
+		stream, err := p.streamManager.GetOrCreateStream(speakerID, sourceLang)
+		if err != nil {
+			atomic.AddInt64(&p.totalErrors, 1)
+			return nil, err
+		}
+		// Start processing transcripts if this is a new stream
+		go p.processTranscriptsOnce(stream, sourceLang)
+		return stream, nil
+	}
+
+	// Legacy mode: per-speaker streams
 	key := speakerID + ":" + sourceLang
 
 	// First try with read lock for fast path (existing healthy stream)
@@ -370,7 +475,7 @@ func (p *Pipeline) getOrCreateStream(speakerID, sourceLang string) (*TranscribeS
 		if !stream.IsClosed() {
 			return stream, nil
 		}
-		// Stream is dead, remove it
+		// Stream is dead, remove it immediately
 		delete(p.speakerStreams, key)
 		delete(p.streamLastActive, key)
 		log.Printf("[AWS Pipeline] Removed dead stream for speaker %s, will recreate", speakerID)
@@ -384,14 +489,14 @@ func (p *Pipeline) getOrCreateStream(speakerID, sourceLang string) (*TranscribeS
 		return nil, err
 	}
 
-	// Set callbacks for stream lifecycle events
-	// Note: callbacks should not try to acquire streamsMu to avoid deadlock
+	// Set callbacks for stream lifecycle events with immediate cleanup
 	stream.SetCallbacks(
-		// onDead callback - just log, don't modify map (will be cleaned up lazily)
+		// onDead callback - immediately remove from map
 		func(spkID, srcLang string, attempt int) {
 			log.Printf("[AWS Pipeline] ☠️ Stream died for speaker %s (lang: %s)", spkID, srcLang)
 			atomic.AddInt64(&p.totalErrors, 1)
-			// Stream will be removed lazily on next getOrCreateStream call
+			// Immediately remove dead stream from map (use goroutine to avoid deadlock)
+			go p.removeDeadStream(spkID, srcLang)
 		},
 		// onReconnect callback
 		func(spkID, srcLang string, attempt int) {
@@ -408,6 +513,35 @@ func (p *Pipeline) getOrCreateStream(speakerID, sourceLang string) (*TranscribeS
 	log.Printf("[AWS Pipeline] Created Transcribe stream for speaker %s (lang: %s)", speakerID, sourceLang)
 
 	return stream, nil
+}
+
+// removeDeadStream immediately removes a dead stream from the map
+func (p *Pipeline) removeDeadStream(speakerID, sourceLang string) {
+	key := speakerID + ":" + sourceLang
+	p.streamsMu.Lock()
+	defer p.streamsMu.Unlock()
+
+	if stream, exists := p.speakerStreams[key]; exists {
+		if stream.IsClosed() {
+			delete(p.speakerStreams, key)
+			delete(p.streamLastActive, key)
+			log.Printf("[AWS Pipeline] Immediately removed dead stream: %s", key)
+		}
+	}
+}
+
+// processTranscriptsOnce is a wrapper that ensures only one goroutine processes a stream per language.
+// Uses per-pipeline tracking to avoid collisions between pipelines.
+func (p *Pipeline) processTranscriptsOnce(stream *TranscribeStream, sourceLang string) {
+	// Use sourceLang as key to ensure one processor per language per pipeline
+	key := sourceLang
+	if _, loaded := p.streamProcessors.LoadOrStore(key, true); loaded {
+		// Another goroutine is already processing this stream
+		return
+	}
+	defer p.streamProcessors.Delete(key)
+
+	p.processTranscripts(stream, sourceLang)
 }
 
 // processTranscripts handles transcripts from a speaker stream
@@ -596,8 +730,20 @@ func (p *Pipeline) sendPartialTranscript(result *TranscriptResult) {
 	text := strings.TrimSpace(result.Text)
 	runes := []rune(text)
 
-	// Skip empty or single character
-	if len(runes) < 1 {
+	// Language-specific minimum length to reduce choppy updates
+	// Japanese tends to have more granular partials, so require more characters
+	minLen := 2
+	switch result.Language {
+	case "ja":
+		minLen = 4 // Japanese: require at least 4 characters to reduce word-by-word updates
+	case "en":
+		minLen = 3 // English: require at least 3 characters
+	case "zh":
+		minLen = 3 // Chinese: require at least 3 characters
+	}
+
+	// Skip too short partials
+	if len(runes) < minLen {
 		return
 	}
 
@@ -1148,6 +1294,13 @@ func (p *Pipeline) UpdateTargetLanguages(langs []string) {
 
 // RemoveSpeakerStream removes a speaker's transcription stream
 func (p *Pipeline) RemoveSpeakerStream(speakerID, sourceLang string) {
+	// Use StreamManager if enabled
+	if p.useStreamManager && p.streamManager != nil {
+		p.streamManager.ReleaseSpeaker(speakerID, sourceLang)
+		return
+	}
+
+	// Legacy mode
 	key := speakerID + ":" + sourceLang
 
 	p.streamsMu.Lock()
@@ -1156,14 +1309,26 @@ func (p *Pipeline) RemoveSpeakerStream(speakerID, sourceLang string) {
 	if stream, exists := p.speakerStreams[key]; exists {
 		stream.Close()
 		delete(p.speakerStreams, key)
+		delete(p.streamLastActive, key)
 		log.Printf("[AWS Pipeline] Removed stream for speaker %s", speakerID)
 	}
 }
 
 // Close shuts down the pipeline
 func (p *Pipeline) Close() error {
+	// Prevent double-close panics
+	if !atomic.CompareAndSwapInt32(&p.closed, 0, 1) {
+		return nil // Already closed
+	}
+
 	p.cancel()
 
+	// Close StreamManager if using language-based pooling
+	if p.streamManager != nil {
+		p.streamManager.Close()
+	}
+
+	// Close legacy per-speaker streams
 	p.streamsMu.Lock()
 	for key, stream := range p.speakerStreams {
 		stream.Close()
@@ -1171,9 +1336,22 @@ func (p *Pipeline) Close() error {
 	}
 	p.streamsMu.Unlock()
 
+	// Close worker pools if using them
+	if p.translatePool != nil {
+		p.translatePool.Close()
+	}
+	if p.ttsPool != nil {
+		p.ttsPool.Close()
+	}
+
 	// Close cache
 	if p.cache != nil {
 		p.cache.Close()
+	}
+
+	// Release client pool reference
+	if p.clientPool != nil {
+		p.clientPool.Release()
 	}
 
 	close(p.TranscriptChan)
