@@ -582,6 +582,11 @@ func (ts *TranscribeStream) attemptReconnect() error {
 	// Flush pending audio
 	ts.flushPendingAudio()
 
+	// FIX: Restart sendAudioLoop since the old one exited on context cancellation.
+	// When we call ts.cancel() above, the old sendAudioLoop returns on <-ctx.Done().
+	// Without restarting it, the audioIn channel fills up and all audio is dropped.
+	go ts.sendAudioLoop()
+
 	log.Printf("[Transcribe] Successfully reconnected stream for %s", ts.speakerID)
 	return nil
 }
