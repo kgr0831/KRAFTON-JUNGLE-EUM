@@ -38,6 +38,11 @@ interface UseRemoteParticipantTranslationOptions {
     onError?: (error: Error) => void;
 }
 
+// WebSocket 재연결 설정
+const WS_RECONNECT_MAX_RETRIES = 5;
+const WS_RECONNECT_BASE_DELAY_MS = 1000;
+const WS_RECONNECT_MAX_DELAY_MS = 30000;
+
 interface ParticipantStream {
     participantId: string;
     ws: WebSocket;
@@ -53,6 +58,12 @@ interface ParticipantStream {
     lastSpeechTime: number;
     // 오디오 손실 방지를 위한 강제 전송 타이머
     lastSendTime: number;
+    // WebSocket 재연결 관련 상태
+    reconnectAttempts: number;
+    reconnectTimeoutId: NodeJS.Timeout | null;
+    isIntentionalClose: boolean;
+    mediaStream: MediaStream | null;
+    remoteSourceLang: TargetLanguage;
 }
 
 interface UseRemoteParticipantTranslationReturn {
@@ -278,6 +289,12 @@ export function useRemoteParticipantTranslation({
 
         console.log(`[RemoteTranslation] Cleaning up stream for ${participantId}`);
 
+        // 0. 재연결 타이머 취소
+        if (stream.reconnectTimeoutId) {
+            clearTimeout(stream.reconnectTimeoutId);
+            stream.reconnectTimeoutId = null;
+        }
+
         // 1. 분석 인터벌 중지
         if (stream.analysisInterval) {
             clearInterval(stream.analysisInterval);
@@ -305,7 +322,8 @@ export function useRemoteParticipantTranslation({
             });
         }
 
-        // 5. WebSocket 닫기
+        // 5. WebSocket 닫기 (의도적 종료로 표시하여 재연결 방지)
+        stream.isIntentionalClose = true;
         if (stream.ws) {
             if (stream.ws.readyState === WebSocket.OPEN || stream.ws.readyState === WebSocket.CONNECTING) {
                 stream.ws.close();
@@ -315,6 +333,9 @@ export function useRemoteParticipantTranslation({
 
         // 6. 버퍼 비우기
         stream.audioBuffer = [];
+
+        // 7. MediaStream 정리 (선택적 - 트랙은 LiveKit이 관리)
+        stream.mediaStream = null;
 
         streamsRef.current.delete(participantId);
         console.log(`[RemoteTranslation] Stream cleanup complete for ${participantId}`);
@@ -362,6 +383,170 @@ export function useRemoteParticipantTranslation({
 
         stream.ws.send(int16Data.buffer);
         console.log(`[RemoteTranslation] ${stream.participantId}: Sent ${int16Data.length} samples (${(int16Data.length / SAMPLE_RATE).toFixed(1)}s) - ${reason} | RMS=${sendRms.toFixed(6)}, Max=${sendMax.toFixed(6)}`);
+    };
+
+    // WebSocket 재연결 함수
+    const reconnectWebSocket = (stream: ParticipantStream, participant: RemoteParticipant | LocalParticipant) => {
+        if (stream.isIntentionalClose) {
+            console.log(`[RemoteTranslation] ${stream.participantId}: Skipping reconnect (intentional close)`);
+            return;
+        }
+
+        if (stream.reconnectAttempts >= WS_RECONNECT_MAX_RETRIES) {
+            console.error(`[RemoteTranslation] ${stream.participantId}: Max reconnect attempts (${WS_RECONNECT_MAX_RETRIES}) reached, giving up`);
+            cleanupParticipantStream(stream.participantId);
+            return;
+        }
+
+        // 지수 백오프 계산
+        const delay = Math.min(
+            WS_RECONNECT_BASE_DELAY_MS * Math.pow(2, stream.reconnectAttempts),
+            WS_RECONNECT_MAX_DELAY_MS
+        );
+
+        stream.reconnectAttempts++;
+        console.log(`[RemoteTranslation] ${stream.participantId}: 🔄 Reconnecting in ${delay}ms (attempt ${stream.reconnectAttempts}/${WS_RECONNECT_MAX_RETRIES})`);
+
+        stream.reconnectTimeoutId = setTimeout(() => {
+            // 스트림이 여전히 존재하는지 확인
+            const currentStream = streamsRef.current.get(stream.participantId);
+            if (!currentStream || currentStream.isIntentionalClose) {
+                console.log(`[RemoteTranslation] ${stream.participantId}: Stream no longer exists, cancelling reconnect`);
+                return;
+            }
+
+            // MediaStream이 여전히 유효한지 확인
+            if (!currentStream.mediaStream || currentStream.mediaStream.getTracks().every(t => t.readyState === 'ended')) {
+                console.log(`[RemoteTranslation] ${stream.participantId}: MediaStream no longer valid, cancelling reconnect`);
+                cleanupParticipantStream(stream.participantId);
+                return;
+            }
+
+            // 새 WebSocket 생성
+            const actualListenerId = listenerIdRef.current || localParticipantIdRef.current || 'unknown';
+            const wsUrl = `${WS_BASE_URL}?roomId=${encodeURIComponent(roomIdRef.current)}&listenerId=${encodeURIComponent(actualListenerId)}&sourceLang=${currentStream.remoteSourceLang}&targetLang=${targetLanguageRef.current}&participantId=${encodeURIComponent(stream.participantId)}`;
+
+            console.log(`[RemoteTranslation] ${stream.participantId}: Creating new WebSocket connection`);
+            const ws = new WebSocket(wsUrl);
+            ws.binaryType = 'arraybuffer';
+
+            currentStream.ws = ws;
+            currentStream.isHandshakeComplete = false;
+
+            setupWebSocketHandlers(ws, currentStream, participant);
+        }, delay);
+    };
+
+    // WebSocket 이벤트 핸들러 설정 (재연결 시 재사용)
+    const setupWebSocketHandlers = (ws: WebSocket, stream: ParticipantStream, participant: RemoteParticipant | LocalParticipant) => {
+        const participantId = stream.participantId;
+
+        ws.onopen = async () => {
+            console.log(`[RemoteTranslation] ${participantId}: WebSocket opened, sending handshake`);
+
+            // 재연결 성공 시 카운터 리셋
+            stream.reconnectAttempts = 0;
+
+            // Send metadata header
+            const metadata = createMetadataHeader(SAMPLE_RATE, 1, 16);
+            ws.send(metadata);
+        };
+
+        ws.onmessage = (event) => {
+            const currentStream = streamsRef.current.get(participantId);
+            if (!currentStream) return;
+
+            // Handshake response
+            if (!currentStream.isHandshakeComplete && typeof event.data === 'string') {
+                try {
+                    const response = JSON.parse(event.data);
+                    if (response.status === 'ready') {
+                        console.log(`[RemoteTranslation] ${participantId}: Handshake complete`);
+                        currentStream.isHandshakeComplete = true;
+
+                        // Start audio capture after handshake (재연결 시에도)
+                        if (!currentStream.sourceNode && currentStream.mediaStream) {
+                            startAudioCapture(participantId, currentStream.mediaStream);
+                        }
+                    }
+                } catch (e) {
+                    console.error(`[RemoteTranslation] ${participantId}: Failed to parse handshake:`, e);
+                }
+                return;
+            }
+
+            // Transcript message
+            if (typeof event.data === 'string') {
+                try {
+                    const data = JSON.parse(event.data);
+                    if (data.type === 'transcript') {
+                        // 접두사 제거 함수
+                        const stripPrefixes = (text: string | undefined): string => {
+                            if (!text) return '';
+                            return text
+                                .replace(/^\[FINAL\]\s*/i, '')
+                                .replace(/^\[LLM\]\s*/i, '')
+                                .replace(/^\[PARTIAL\]\s*/i, '')
+                                .trim();
+                        };
+
+                        const transcriptData: RemoteTranscriptData = {
+                            participantId: data.participantId || participantId,
+                            participantName: participant.name || participantId,
+                            profileImg: getParticipantProfileImg(participant),
+                            original: stripPrefixes(data.original) || stripPrefixes(data.text),
+                            translated: stripPrefixes(data.translated),
+                            isFinal: data.isFinal,
+                        };
+
+                        console.log(`[RemoteTranslation] ${participantId}: Transcript received:`, transcriptData);
+
+                        setTranscripts(prev => {
+                            const newMap = new Map(prev);
+                            newMap.set(participantId, transcriptData);
+                            return newMap;
+                        });
+
+                        onTranscriptRef.current?.(transcriptData);
+                    }
+                } catch (e) {
+                    console.error(`[RemoteTranslation] ${participantId}: Failed to parse message:`, e);
+                }
+            } else if (event.data instanceof ArrayBuffer) {
+                // TTS audio (MP3 format) - only play when translation mode is enabled AND not for local participant
+                console.log(`[RemoteTranslation] ${participantId}: Received TTS audio (MP3):`, event.data.byteLength, "bytes");
+                const currentIsLocal = participantId === localParticipantIdRef.current;
+                if (autoPlayTTSRef.current && enabledRef.current && !currentIsLocal) {
+                    // Don't pass sampleRate to use MP3 decoding instead of PCM
+                    queueAudioRef.current(event.data, undefined, participantId);
+                } else if (currentIsLocal) {
+                    console.log(`[RemoteTranslation] ${participantId}: Skipping TTS for local participant`);
+                }
+            }
+        };
+
+        ws.onerror = (event) => {
+            console.error(`[RemoteTranslation] ${participantId}: WebSocket error:`, event);
+            const err = new Error(`WebSocket error for ${participantId}`);
+            setError(err);
+            onErrorRef.current?.(err);
+        };
+
+        ws.onclose = (event) => {
+            console.log(`[RemoteTranslation] ${participantId}: WebSocket closed (code: ${event.code}, reason: ${event.reason})`);
+
+            const currentStream = streamsRef.current.get(participantId);
+            if (!currentStream) return;
+
+            // 의도적 종료가 아니면 재연결 시도
+            if (!currentStream.isIntentionalClose) {
+                console.log(`[RemoteTranslation] ${participantId}: Unexpected close, attempting reconnect...`);
+                reconnectWebSocket(currentStream, participant);
+            } else {
+                console.log(`[RemoteTranslation] ${participantId}: Intentional close, no reconnect`);
+                streamsRef.current.delete(participantId);
+            }
+        };
     };
 
     const startAudioCapture = async (participantId: string, mediaStream: MediaStream) => {
@@ -615,104 +800,20 @@ export function useRemoteParticipantTranslation({
                 lastSpeechTime: Date.now(),
                 // 강제 전송 타이머 초기화
                 lastSendTime: Date.now(),
+                // WebSocket 재연결 상태 초기화
+                reconnectAttempts: 0,
+                reconnectTimeoutId: null,
+                isIntentionalClose: false,
+                mediaStream,
+                remoteSourceLang,
             };
 
             streamsRef.current.set(participantId, stream);
             creatingStreamsRef.current.delete(participantId);  // 락 해제 (스트림 등록 완료)
             console.log(`[RemoteTranslation] Lock released for ${participantId} (stream registered)`);
 
-            // WebSocket handlers
-            ws.onopen = async () => {
-                console.log(`[RemoteTranslation] ${participantId}: WebSocket opened, sending handshake`);
-
-                // Send metadata header
-                const metadata = createMetadataHeader(SAMPLE_RATE, 1, 16);
-                ws.send(metadata);
-            };
-
-            ws.onmessage = (event) => {
-                const currentStream = streamsRef.current.get(participantId);
-                if (!currentStream) return;
-
-                // Handshake response
-                if (!currentStream.isHandshakeComplete && typeof event.data === 'string') {
-                    try {
-                        const response = JSON.parse(event.data);
-                        if (response.status === 'ready') {
-                            console.log(`[RemoteTranslation] ${participantId}: Handshake complete`);
-                            currentStream.isHandshakeComplete = true;
-
-                            // Start audio capture after handshake
-                            startAudioCapture(participantId, mediaStream);
-                        }
-                    } catch (e) {
-                        console.error(`[RemoteTranslation] ${participantId}: Failed to parse handshake:`, e);
-                    }
-                    return;
-                }
-
-                // Transcript message
-                if (typeof event.data === 'string') {
-                    try {
-                        const data = JSON.parse(event.data);
-                        if (data.type === 'transcript') {
-                            // 접두사 제거 함수
-                            const stripPrefixes = (text: string | undefined): string => {
-                                if (!text) return '';
-                                return text
-                                    .replace(/^\[FINAL\]\s*/i, '')
-                                    .replace(/^\[LLM\]\s*/i, '')
-                                    .replace(/^\[PARTIAL\]\s*/i, '')
-                                    .trim();
-                            };
-
-                            const transcriptData: RemoteTranscriptData = {
-                                participantId: data.participantId || participantId,
-                                participantName: participant.name || participantId,
-                                profileImg: getParticipantProfileImg(participant),
-                                original: stripPrefixes(data.original) || stripPrefixes(data.text),
-                                translated: stripPrefixes(data.translated),
-                                isFinal: data.isFinal,
-                            };
-
-                            console.log(`[RemoteTranslation] ${participantId}: Transcript received:`, transcriptData);
-
-                            setTranscripts(prev => {
-                                const newMap = new Map(prev);
-                                newMap.set(participantId, transcriptData);
-                                return newMap;
-                            });
-
-                            onTranscriptRef.current?.(transcriptData);
-                        }
-                    } catch (e) {
-                        console.error(`[RemoteTranslation] ${participantId}: Failed to parse message:`, e);
-                    }
-                } else if (event.data instanceof ArrayBuffer) {
-                    // TTS audio (MP3 format) - only play when translation mode is enabled AND not for local participant
-                    console.log(`[RemoteTranslation] ${participantId}: Received TTS audio (MP3):`, event.data.byteLength, "bytes");
-                    const currentIsLocal = participantId === localParticipantIdRef.current;
-                    if (autoPlayTTSRef.current && enabledRef.current && !currentIsLocal) {
-                        // Don't pass sampleRate to use MP3 decoding instead of PCM
-                        queueAudioRef.current(event.data, undefined, participantId);
-                    } else if (currentIsLocal) {
-                        console.log(`[RemoteTranslation] ${participantId}: Skipping TTS for local participant`);
-                    }
-                }
-            };
-
-            ws.onerror = (event) => {
-                console.error(`[RemoteTranslation] ${participantId}: WebSocket error:`, event);
-                const err = new Error(`WebSocket error for ${participantId}`);
-                setError(err);
-                onErrorRef.current?.(err);
-            };
-
-            ws.onclose = () => {
-                console.log(`[RemoteTranslation] ${participantId}: WebSocket closed`);
-                // Don't call cleanup here to avoid recursive issues
-                streamsRef.current.delete(participantId);
-            };
+            // WebSocket 핸들러 설정 (재연결 시 재사용 가능한 함수 사용)
+            setupWebSocketHandlers(ws, stream, participant);
 
         } catch (err) {
             console.error(`[RemoteTranslation] ${participantId}: Failed to create stream:`, err);
