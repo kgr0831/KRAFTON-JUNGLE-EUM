@@ -10,7 +10,6 @@ import (
 
 func main() {
 	// 설정 로드
-	// 설정 로드2
 	cfg := config.Load()
 
 	// 데이터베이스 연결
@@ -40,5 +39,4 @@ func main() {
 	if err := srv.Start(); err != nil {
 		log.Fatalf("Server failed to start: %v", err)
 	}
-	// Trigger restartAction
 }
