@@ -4,14 +4,18 @@ import (
 	"context"
 	"encoding/json"
 	"log"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/gofiber/contrib/websocket"
+	"gorm.io/gorm"
 
 	"realtime-backend/internal/ai"
 	awsai "realtime-backend/internal/aws"
+	"realtime-backend/internal/cache"
 	"realtime-backend/internal/config"
+	"realtime-backend/internal/model"
 )
 
 // =============================================================================
@@ -20,27 +24,31 @@ import (
 
 // RoomHub manages all rooms and their connections
 type RoomHub struct {
-	rooms    map[string]*Room
-	mu       sync.RWMutex
-	aiClient *ai.GrpcClient  // Python gRPC 클라이언트
-	useAWS   bool            // AWS 직접 사용 여부
-	cfg      *config.Config  // 앱 설정
+	rooms         map[string]*Room
+	mu            sync.RWMutex
+	aiClient      *ai.GrpcClient        // Python gRPC 클라이언트
+	useAWS        bool                  // AWS 직접 사용 여부
+	cfg           *config.Config        // 앱 설정
+	redisClient   *cache.RedisClient    // Redis/Valkey 클라이언트
+	db            *gorm.DB              // Database for saving transcripts
+	awsClientPool *awsai.AWSClientPool  // 공유 AWS 클라이언트 풀
 }
 
 // Room represents a single room with listeners and speakers
 type Room struct {
-	ID          string
-	Listeners   map[string]*Listener
-	Speakers    map[string]*Speaker
-	grpcStream  *ai.ChatStream     // Python gRPC 스트림
-	awsPipeline *awsai.Pipeline    // AWS 파이프라인
-	broadcast   chan *BroadcastMessage
-	audioIn     chan *AudioMessage
-	ctx         context.Context
-	cancel      context.CancelFunc
-	mu          sync.RWMutex
-	hub         *RoomHub
-	isRunning   bool
+	ID               string
+	Listeners        map[string]*Listener
+	Speakers         map[string]*Speaker
+	SenderToSpeakers map[string]map[string]bool // FIX: Track which speakers each sender (listener) has sent audio for
+	grpcStream       *ai.ChatStream             // Python gRPC 스트림
+	awsPipeline      *awsai.Pipeline            // AWS 파이프라인
+	broadcast        chan *BroadcastMessage
+	audioIn          chan *AudioMessage
+	ctx              context.Context
+	cancel           context.CancelFunc
+	mu               sync.RWMutex
+	hub              *RoomHub
+	isRunning        bool
 }
 
 // Listener represents a user receiving translations
@@ -85,13 +93,47 @@ type TranscriptData struct {
 }
 
 // NewRoomHub creates a new RoomHub instance
-func NewRoomHub(aiClient *ai.GrpcClient, cfg *config.Config, useAWS bool) *RoomHub {
-	return &RoomHub{
-		rooms:    make(map[string]*Room),
-		aiClient: aiClient,
-		cfg:      cfg,
-		useAWS:   useAWS,
+func NewRoomHub(aiClient *ai.GrpcClient, cfg *config.Config, useAWS bool, redisClient *cache.RedisClient) *RoomHub {
+	hub := &RoomHub{
+		rooms:       make(map[string]*Room),
+		aiClient:    aiClient,
+		cfg:         cfg,
+		useAWS:      useAWS,
+		redisClient: redisClient,
 	}
+
+	// Initialize shared AWS client pool if using AWS
+	if useAWS && cfg != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+
+		clientPool, err := awsai.NewAWSClientPool(ctx, cfg, awsai.DefaultAWSClientPoolConfig())
+		if err != nil {
+			log.Printf("[RoomHub] ⚠️ Failed to create AWS client pool: %v (will create clients per room)", err)
+		} else {
+			hub.awsClientPool = clientPool
+			log.Printf("[RoomHub] ✅ AWS client pool initialized")
+		}
+	}
+
+	return hub
+}
+
+// SetDB sets the database connection for saving transcripts
+func (h *RoomHub) SetDB(db *gorm.DB) {
+	h.db = db
+}
+
+// GetTranscripts retrieves transcripts from Redis for a room
+func (h *RoomHub) GetTranscripts(roomID string) ([]cache.RoomTranscript, error) {
+	if h.redisClient == nil {
+		return nil, nil
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	return h.redisClient.GetTranscripts(ctx, roomID)
 }
 
 // GetOrCreateRoom gets an existing room or creates a new one
@@ -105,15 +147,16 @@ func (h *RoomHub) GetOrCreateRoom(roomID string) *Room {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	room := &Room{
-		ID:        roomID,
-		Listeners: make(map[string]*Listener),
-		Speakers:  make(map[string]*Speaker),
-		broadcast: make(chan *BroadcastMessage, 100),
-		audioIn:   make(chan *AudioMessage, 100),
-		ctx:       ctx,
-		cancel:    cancel,
-		hub:       h,
-		isRunning: false,
+		ID:               roomID,
+		Listeners:        make(map[string]*Listener),
+		Speakers:         make(map[string]*Speaker),
+		SenderToSpeakers: make(map[string]map[string]bool), // FIX: Initialize sender-to-speakers tracking
+		broadcast:        make(chan *BroadcastMessage, 100),
+		audioIn:          make(chan *AudioMessage, 100),
+		ctx:              ctx,
+		cancel:           cancel,
+		hub:              h,
+		isRunning:        false,
 	}
 
 	h.rooms[roomID] = room
@@ -152,6 +195,20 @@ func (r *Room) AddListener(listenerID, targetLang string, conn *websocket.Conn) 
 	log.Printf("[Room %s] Added listener: %s (target: %s), total: %d",
 		r.ID, listenerID, targetLang, len(r.Listeners))
 
+	// Update target languages in AWS pipeline when new listener joins
+	if r.hub.useAWS && r.awsPipeline != nil {
+		targetLangs := make([]string, 0)
+		langSet := make(map[string]bool)
+		for _, l := range r.Listeners {
+			if !langSet[l.TargetLang] {
+				langSet[l.TargetLang] = true
+				targetLangs = append(targetLangs, l.TargetLang)
+			}
+		}
+		log.Printf("[Room %s] 🔄 Updating target languages: %v", r.ID, targetLangs)
+		r.awsPipeline.UpdateTargetLanguages(targetLangs)
+	}
+
 	// Start room processing if not already running
 	if !r.isRunning {
 		r.isRunning = true
@@ -169,12 +226,47 @@ func (r *Room) RemoveListener(listenerID string) {
 	log.Printf("[Room %s] Removed listener: %s, remaining: %d",
 		r.ID, listenerID, len(r.Listeners))
 
+	// Update target languages in AWS pipeline (deduplicated)
+	if r.hub.useAWS && r.awsPipeline != nil {
+		targetLangs := make([]string, 0)
+		langSet := make(map[string]bool)
+		for _, l := range r.Listeners {
+			if !langSet[l.TargetLang] {
+				langSet[l.TargetLang] = true
+				targetLangs = append(targetLangs, l.TargetLang)
+			}
+		}
+		r.awsPipeline.UpdateTargetLanguages(targetLangs)
+	}
+}
+
+// UpdateListenerTargetLang updates a listener's target language
+func (r *Room) UpdateListenerTargetLang(listenerID, newTargetLang string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	listener, exists := r.Listeners[listenerID]
+	if !exists {
+		return
+	}
+
+	oldLang := listener.TargetLang
+	listener.TargetLang = newTargetLang
+
+	log.Printf("[Room %s] Listener %s changed target language: %s -> %s",
+		r.ID, listenerID, oldLang, newTargetLang)
+
 	// Update target languages in AWS pipeline
 	if r.hub.useAWS && r.awsPipeline != nil {
 		targetLangs := make([]string, 0)
+		langSet := make(map[string]bool)
 		for _, l := range r.Listeners {
-			targetLangs = append(targetLangs, l.TargetLang)
+			if !langSet[l.TargetLang] {
+				langSet[l.TargetLang] = true
+				targetLangs = append(targetLangs, l.TargetLang)
+			}
 		}
+		log.Printf("[Room %s] 🔄 Updating target languages: %v", r.ID, targetLangs)
 		r.awsPipeline.UpdateTargetLanguages(targetLangs)
 	}
 
@@ -216,16 +308,111 @@ func (r *Room) RemoveSpeaker(speakerID string) {
 	}
 }
 
+// TrackSpeakerForSender tracks which speaker a sender (listener) has sent audio for.
+// This allows proper cleanup when the sender disconnects.
+func (r *Room) TrackSpeakerForSender(senderID, speakerID string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if r.SenderToSpeakers == nil {
+		r.SenderToSpeakers = make(map[string]map[string]bool)
+	}
+	if r.SenderToSpeakers[senderID] == nil {
+		r.SenderToSpeakers[senderID] = make(map[string]bool)
+	}
+	r.SenderToSpeakers[senderID][speakerID] = true
+}
+
+// RemoveSpeakersForSender removes all speakers that a sender has sent audio for.
+// Called when a listener disconnects to clean up their associated speaker streams.
+func (r *Room) RemoveSpeakersForSender(senderID string) {
+	r.mu.Lock()
+	speakers, exists := r.SenderToSpeakers[senderID]
+	if !exists || len(speakers) == 0 {
+		r.mu.Unlock()
+		return
+	}
+	// Copy speaker IDs and remove from tracking
+	speakerIDs := make([]string, 0, len(speakers))
+	for speakerID := range speakers {
+		speakerIDs = append(speakerIDs, speakerID)
+	}
+	delete(r.SenderToSpeakers, senderID)
+	r.mu.Unlock()
+
+	// Remove each speaker (this will also clean up Transcribe streams)
+	for _, speakerID := range speakerIDs {
+		r.RemoveSpeaker(speakerID)
+	}
+	log.Printf("[Room %s] Cleaned up %d speakers for disconnected sender: %s", r.ID, len(speakerIDs), senderID)
+}
+
+// HasSpeaker checks if a speaker exists in the room
+func (r *Room) HasSpeaker(speakerID string) bool {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	_, exists := r.Speakers[speakerID]
+	return exists
+}
+
 // AddOrUpdateSpeaker adds or updates a speaker
 func (r *Room) AddOrUpdateSpeaker(speakerID, sourceLang, nickname, profileImg string) {
 	r.mu.Lock()
-	defer r.mu.Unlock()
+
+	// Check if sourceLang changed - need to cleanup old Transcribe stream
+	oldSourceLang := ""
+	if existingSpeaker, exists := r.Speakers[speakerID]; exists {
+		oldSourceLang = existingSpeaker.SourceLang
+	}
 
 	r.Speakers[speakerID] = &Speaker{
 		ID:         speakerID,
 		SourceLang: sourceLang,
 		Nickname:   nickname,
 		ProfileImg: profileImg,
+	}
+
+	// FIX: Auto-update listener's targetLang to match sourceLang for bidirectional translation.
+	// When a Korean speaker (sourceLang=ko) connects, they should receive Korean translations
+	// of what other language speakers say. Without this, Korean speakers with targetLang=en
+	// would never receive Korean translations, breaking bidirectional translation.
+	listenerNeedsUpdate := false
+	var oldTargetLang string
+	if listener, exists := r.Listeners[speakerID]; exists {
+		if listener.TargetLang != sourceLang {
+			oldTargetLang = listener.TargetLang
+			listener.TargetLang = sourceLang
+			listenerNeedsUpdate = true
+		}
+	}
+	r.mu.Unlock()
+
+	// If sourceLang changed, clean up the old Transcribe stream
+	if oldSourceLang != "" && oldSourceLang != sourceLang {
+		log.Printf("[Room %s] Speaker %s changed language: %s -> %s, cleaning up old stream",
+			r.ID, speakerID, oldSourceLang, sourceLang)
+		if r.hub.useAWS && r.awsPipeline != nil {
+			r.awsPipeline.RemoveSpeakerStream(speakerID, oldSourceLang)
+		}
+	}
+
+	// Update target languages in AWS pipeline if listener targetLang was changed
+	if listenerNeedsUpdate {
+		log.Printf("[Room %s] 🔄 Auto-updated listener %s targetLang: %s -> %s (matching sourceLang for bidirectional translation)",
+			r.ID, speakerID, oldTargetLang, sourceLang)
+		if r.hub.useAWS && r.awsPipeline != nil {
+			r.mu.RLock()
+			targetLangs := make([]string, 0)
+			langSet := make(map[string]bool)
+			for _, l := range r.Listeners {
+				if !langSet[l.TargetLang] {
+					langSet[l.TargetLang] = true
+					targetLangs = append(targetLangs, l.TargetLang)
+				}
+			}
+			r.mu.RUnlock()
+			r.awsPipeline.UpdateTargetLanguages(targetLangs)
+		}
 	}
 
 	log.Printf("[Room %s] Added/updated speaker: %s (source: %s)",
@@ -251,6 +438,10 @@ func (r *Room) GetTargetLanguages() []string {
 
 // SendAudio sends audio from a speaker to be processed
 func (r *Room) SendAudio(speakerID, sourceLang string, audioData []byte) {
+	// Trim whitespace from speakerID (frontend may send padded IDs)
+	speakerID = strings.TrimSpace(speakerID)
+	sourceLang = strings.TrimSpace(sourceLang)
+
 	select {
 	case r.audioIn <- &AudioMessage{
 		SpeakerID:  speakerID,
@@ -283,10 +474,92 @@ func (r *Room) Shutdown() {
 	}
 	r.mu.Unlock()
 
+	// Save transcripts to database before shutdown
+	r.saveTranscriptsToDatabase()
+
 	close(r.broadcast)
 	close(r.audioIn)
 	r.isRunning = false
 	log.Printf("[Room %s] Shutdown complete", r.ID)
+}
+
+// saveTranscriptsToDatabase flushes Redis transcripts to the database
+func (r *Room) saveTranscriptsToDatabase() {
+	if r.hub.redisClient == nil || r.hub.db == nil {
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	// Get and delete transcripts from Redis
+	transcripts, err := r.hub.redisClient.FlushRoom(ctx, r.ID)
+	if err != nil {
+		log.Printf("[Room %s] Failed to flush transcripts from Redis: %v", r.ID, err)
+		return
+	}
+
+	if len(transcripts) == 0 {
+		log.Printf("[Room %s] No transcripts to save to database", r.ID)
+		return
+	}
+
+	// Parse meetingID from roomID (format: "meeting-{id}")
+	var meeting model.Meeting
+	if strings.HasPrefix(r.ID, "meeting-") {
+		meetingIDStr := strings.TrimPrefix(r.ID, "meeting-")
+		if err := r.hub.db.Where("id = ?", meetingIDStr).First(&meeting).Error; err != nil {
+			log.Printf("[Room %s] Meeting ID %s not found, skipping DB save: %v", r.ID, meetingIDStr, err)
+			return
+		}
+	} else {
+		// Try to find by code as fallback
+		if err := r.hub.db.Where("code = ?", r.ID).First(&meeting).Error; err != nil {
+			log.Printf("[Room %s] Meeting not found by code, skipping DB save: %v", r.ID, err)
+			return
+		}
+	}
+
+	// Convert Redis transcripts to VoiceRecord models
+	voiceRecords := make([]model.VoiceRecord, 0, len(transcripts))
+	for _, t := range transcripts {
+		// Only save final transcripts to avoid duplicates
+		if !t.IsFinal {
+			continue
+		}
+
+		record := model.VoiceRecord{
+			MeetingID:   meeting.ID,
+			SpeakerName: t.SpeakerName,
+			Original:    t.Original,
+			CreatedAt:   t.Timestamp,
+		}
+
+		if t.SourceLang != "" {
+			record.SourceLang = &t.SourceLang
+		}
+		if t.Translated != "" {
+			record.Translated = &t.Translated
+		}
+		if t.TargetLang != "" {
+			record.TargetLang = &t.TargetLang
+		}
+
+		voiceRecords = append(voiceRecords, record)
+	}
+
+	if len(voiceRecords) == 0 {
+		log.Printf("[Room %s] No final transcripts to save", r.ID)
+		return
+	}
+
+	// Bulk insert to database
+	if err := r.hub.db.Create(&voiceRecords).Error; err != nil {
+		log.Printf("[Room %s] Failed to save transcripts to database: %v", r.ID, err)
+		return
+	}
+
+	log.Printf("[Room %s] Saved %d transcripts to database (meeting_id: %d)", r.ID, len(voiceRecords), meeting.ID)
 }
 
 // =============================================================================
@@ -320,9 +593,29 @@ func (r *Room) broadcastMessage(msg *BroadcastMessage) {
 	r.mu.RUnlock()
 
 	for _, listener := range listeners {
-		// Transcript messages go to all listeners
-		// Audio messages go only to matching targetLang
-		if msg.Type == "transcript" || msg.TargetLang == listener.TargetLang {
+		// Skip sending to the speaker themselves (don't hear your own translation)
+		if listener.ID == msg.SpeakerID {
+			continue
+		}
+
+		shouldSend := false
+
+		if msg.Type == "transcript" {
+			// For transcripts with translation: only send to matching target language
+			// For original transcripts (no TargetLang): send to everyone except speaker
+			if msg.TargetLang == "" {
+				// Original transcript without translation - send to all (except speaker)
+				shouldSend = true
+			} else if msg.TargetLang == listener.TargetLang {
+				// Translated transcript - only send to listeners with matching target language
+				shouldSend = true
+			}
+		} else if msg.Type == "audio" {
+			// Audio messages go only to matching targetLang (and not the speaker)
+			shouldSend = msg.TargetLang == listener.TargetLang
+		}
+
+		if shouldSend {
 			r.sendToListener(listener, msg)
 		}
 	}
@@ -451,24 +744,58 @@ func (r *Room) startAWSPipeline() error {
 	}
 
 	pipelineCfg := &awsai.PipelineConfig{
-		TargetLanguages: targetLangs,
-		SampleRate:      16000,
+		TargetLanguages:  targetLangs,
+		SampleRate:       16000,
+		UseStreamManager: true, // Enable language-based stream pooling
+		UseWorkerPools:   true, // Enable worker pools for translation/TTS
 	}
 
-	pipeline, err := awsai.NewPipeline(r.ctx, r.hub.cfg, pipelineCfg)
-	if err != nil {
-		log.Printf("[Room %s] Failed to create AWS pipeline: %v", r.ID, err)
-		return err
+	var pipeline *awsai.Pipeline
+	var err error
+
+	// Use shared client pool if available
+	if r.hub.awsClientPool != nil {
+		pipeline, err = awsai.NewPipelineWithClientPool(r.ctx, r.hub.awsClientPool, pipelineCfg)
+		if err != nil {
+			log.Printf("[Room %s] Failed to create AWS pipeline with client pool: %v", r.ID, err)
+			return err
+		}
+		log.Printf("[Room %s] AWS pipeline started with shared client pool (targets: %v)", r.ID, targetLangs)
+	} else {
+		// Fallback to legacy mode (create clients per room)
+		pipelineCfg.UseStreamManager = false // Disable new features for legacy mode
+		pipelineCfg.UseWorkerPools = false
+		pipeline, err = awsai.NewPipeline(r.ctx, r.hub.cfg, pipelineCfg)
+		if err != nil {
+			log.Printf("[Room %s] Failed to create AWS pipeline: %v", r.ID, err)
+			return err
+		}
+		log.Printf("[Room %s] AWS pipeline started in legacy mode (targets: %v)", r.ID, targetLangs)
 	}
 
 	r.mu.Lock()
 	r.awsPipeline = pipeline
+	// After pipeline is set, immediately update target languages with ALL current listeners
+	// This fixes race condition where listeners joined while pipeline was being created
+	currentTargetLangs := make([]string, 0)
+	langSet := make(map[string]bool)
+	for _, l := range r.Listeners {
+		if !langSet[l.TargetLang] {
+			langSet[l.TargetLang] = true
+			currentTargetLangs = append(currentTargetLangs, l.TargetLang)
+		}
+	}
 	r.mu.Unlock()
+
+	// Update with all current listeners' target languages (outside lock to avoid deadlock)
+	if len(currentTargetLangs) > 0 {
+		pipeline.UpdateTargetLanguages(currentTargetLangs)
+		log.Printf("[Room %s] 🔄 Updated target languages after pipeline creation: %v", r.ID, currentTargetLangs)
+	}
 
 	// Start receiving responses from AWS pipeline
 	go r.receiveAWSResponses()
 
-	log.Printf("[Room %s] AWS pipeline started with targets: %v", r.ID, targetLangs)
 	return nil
 }
 
@@ -554,40 +881,94 @@ func (r *Room) receiveGrpcResponses() {
 
 func (r *Room) handleTranscript(t *ai.TranscriptMessage) {
 	speakerID := ""
+	speakerName := ""
 	if t.Speaker != nil {
 		speakerID = t.Speaker.ParticipantId
+		speakerName = t.Speaker.ParticipantId // 또는 Speaker.Nickname이 있으면 사용
 	}
 
-	// Broadcast original transcript to all
-	r.Broadcast(&BroadcastMessage{
-		Type:      "transcript",
-		SpeakerID: speakerID,
-		Data: TranscriptData{
-			ParticipantID: speakerID,
-			Original:      t.OriginalText,
-			IsFinal:       t.IsFinal,
-			Language:      t.OriginalLanguage,
-		},
-	})
+	// 번역이 있는 경우: 번역된 메시지만 전송 (원본 포함됨)
+	// 번역이 없는 경우: 원본만 전송
+	if len(t.Translations) > 0 {
+		// Broadcast translations to each target language (includes original)
+		for _, trans := range t.Translations {
+			r.Broadcast(&BroadcastMessage{
+				Type:       "transcript",
+				SpeakerID:  speakerID,
+				TargetLang: trans.TargetLanguage,
+				Data: TranscriptData{
+					ParticipantID: speakerID,
+					Original:      t.OriginalText,
+					Translated:    trans.TranslatedText,
+					IsFinal:       t.IsFinal,
+					Language:      t.OriginalLanguage,
+				},
+			})
+		}
 
-	// Broadcast translations to each target language
-	for _, trans := range t.Translations {
+		// Save translated transcript to Redis (only once per translation)
+		if t.IsFinal && r.hub.redisClient != nil {
+			for _, trans := range t.Translations {
+				go func(targetLang, translatedText string) {
+					ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+					defer cancel()
+
+					transcript := &cache.RoomTranscript{
+						RoomID:      r.ID,
+						SpeakerID:   speakerID,
+						SpeakerName: speakerName,
+						Original:    t.OriginalText,
+						Translated:  translatedText,
+						SourceLang:  t.OriginalLanguage,
+						TargetLang:  targetLang,
+						IsFinal:     t.IsFinal,
+					}
+
+					if err := r.hub.redisClient.AddTranscript(ctx, r.ID, transcript); err != nil {
+						log.Printf("[Room %s] Failed to save translated transcript to Redis: %v", r.ID, err)
+					}
+				}(trans.TargetLanguage, trans.TranslatedText)
+			}
+		}
+	} else {
+		// No translations - broadcast original only
 		r.Broadcast(&BroadcastMessage{
-			Type:       "transcript",
-			SpeakerID:  speakerID,
-			TargetLang: trans.TargetLanguage,
+			Type:      "transcript",
+			SpeakerID: speakerID,
 			Data: TranscriptData{
 				ParticipantID: speakerID,
 				Original:      t.OriginalText,
-				Translated:    trans.TranslatedText,
 				IsFinal:       t.IsFinal,
-				Language:      trans.TargetLanguage,
+				Language:      t.OriginalLanguage,
 			},
 		})
+
+		// Save original to Redis
+		if t.IsFinal && r.hub.redisClient != nil {
+			go func() {
+				ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+				defer cancel()
+
+				transcript := &cache.RoomTranscript{
+					RoomID:      r.ID,
+					SpeakerID:   speakerID,
+					SpeakerName: speakerName,
+					Original:    t.OriginalText,
+					SourceLang:  t.OriginalLanguage,
+					IsFinal:     t.IsFinal,
+				}
+
+				if err := r.hub.redisClient.AddTranscript(ctx, r.ID, transcript); err != nil {
+					log.Printf("[Room %s] Failed to save transcript to Redis: %v", r.ID, err)
+				}
+			}()
+		}
 	}
 }
 
 func (r *Room) handleAudio(audio *ai.AudioMessage) {
+	log.Printf("[Room %s] 🔊 Broadcasting TTS audio: speaker=%s, targetLang=%s, size=%d bytes",
+		r.ID, audio.SpeakerParticipantID, audio.TargetLanguage, len(audio.AudioData))
 	r.Broadcast(&BroadcastMessage{
 		Type:       "audio",
 		SpeakerID:  audio.SpeakerParticipantID,
@@ -612,18 +993,26 @@ func (r *Room) processAudioAWS(msg *AudioMessage) {
 	r.mu.RUnlock()
 
 	if pipeline == nil {
-		log.Printf("[Room %s] No AWS pipeline, audio dropped", r.ID)
+		log.Printf("[Room %s] ❌ No AWS pipeline, audio dropped (speakerID=%s)", r.ID, msg.SpeakerID)
 		return
 	}
 
 	// Speaker 정보 결정
 	speakerName := msg.SpeakerID
-	if speaker != nil && speaker.Nickname != "" {
-		speakerName = speaker.Nickname
+	profileImg := ""
+	if speaker != nil {
+		if speaker.Nickname != "" {
+			speakerName = speaker.Nickname
+		}
+		profileImg = speaker.ProfileImg
 	}
 
-	if err := pipeline.ProcessAudio(msg.SpeakerID, msg.SourceLang, speakerName, msg.AudioData); err != nil {
-		log.Printf("[Room %s] AWS pipeline error: %v", r.ID, err)
+	// Debug log disabled to reduce noise
+	// log.Printf("[Room %s] 🎤 Processing audio: speaker=%s, lang=%s, size=%d bytes",
+	// 	r.ID, msg.SpeakerID, msg.SourceLang, len(msg.AudioData))
+
+	if err := pipeline.ProcessAudio(msg.SpeakerID, msg.SourceLang, speakerName, profileImg, msg.AudioData); err != nil {
+		log.Printf("[Room %s] ❌ AWS pipeline error: %v", r.ID, err)
 	}
 }
 
@@ -688,4 +1077,37 @@ func (h *RoomHub) CleanupInactiveRooms(maxAge time.Duration) {
 			log.Printf("[RoomHub] Cleaned up inactive room: %s", roomID)
 		}
 	}
+}
+
+// Close shuts down the RoomHub and cleans up all resources
+func (h *RoomHub) Close() {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	// Shutdown all rooms
+	for roomID, room := range h.rooms {
+		room.Shutdown()
+		delete(h.rooms, roomID)
+	}
+
+	// Close the shared AWS client pool
+	if h.awsClientPool != nil {
+		h.awsClientPool.Close()
+		h.awsClientPool = nil
+		log.Printf("[RoomHub] AWS client pool closed")
+	}
+
+	log.Printf("[RoomHub] Shutdown complete")
+}
+
+// GetClientPoolStats returns statistics about the shared AWS client pool
+func (h *RoomHub) GetClientPoolStats() map[string]interface{} {
+	if h.awsClientPool == nil {
+		return map[string]interface{}{
+			"available": false,
+		}
+	}
+	stats := h.awsClientPool.Stats()
+	stats["available"] = true
+	return stats
 }

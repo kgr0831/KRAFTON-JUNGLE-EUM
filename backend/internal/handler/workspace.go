@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"fmt"
 	"log"
 
 	"github.com/gofiber/fiber/v2"
@@ -28,12 +29,13 @@ type CreateWorkspaceRequest struct {
 
 // WorkspaceResponse 워크스페이스 응답
 type WorkspaceResponse struct {
-	ID        int64                     `json:"id"`
-	Name      string                    `json:"name"`
-	OwnerID   int64                     `json:"owner_id"`
-	CreatedAt string                    `json:"created_at"`
-	Owner     *UserResponse             `json:"owner,omitempty"`
-	Members   []WorkspaceMemberResponse `json:"members,omitempty"`
+	ID          int64                     `json:"id"`
+	Name        string                    `json:"name"`
+	OwnerID     int64                     `json:"owner_id"`
+	CreatedAt   string                    `json:"created_at"`
+	Owner       *UserResponse             `json:"owner,omitempty"`
+	Members     []WorkspaceMemberResponse `json:"members,omitempty"`
+	CategoryIDs []int64                   `json:"category_ids,omitempty"`
 }
 
 // WorkspaceMemberResponse 워크스페이스 멤버 응답
@@ -122,7 +124,7 @@ func (h *WorkspaceHandler) CreateWorkspace(c *fiber.Ctx) error {
 		}
 
 		// 기본 권한 부여 (메시지 전송, 음성 접속)
-		defaultPermissions := []string{"SEND_MESSAGES", "CONNECT_VOICE"}
+		defaultPermissions := []string{"SEND_MESSAGES", "CONNECT_MEDIA"}
 		for _, code := range defaultPermissions {
 			if err := tx.Create(&model.RolePermission{
 				RoleID:         defaultRole.ID,
@@ -193,22 +195,55 @@ func (h *WorkspaceHandler) CreateWorkspace(c *fiber.Ctx) error {
 	return c.Status(fiber.StatusCreated).JSON(h.toWorkspaceResponse(&workspace))
 }
 
-// GetMyWorkspaces 내 워크스페이스 목록
+// GetMyWorkspaces 내 워크스페이스 목록 (페이지네이션, 검색, 카테고리 필터 지원)
 func (h *WorkspaceHandler) GetMyWorkspaces(c *fiber.Ctx) error {
 	claims := c.Locals("claims").(*auth.Claims)
 
-	var workspaces []model.Workspace
+	// 쿼리 파라미터
+	limit := c.QueryInt("limit", 0)    // 0이면 전체 조회
+	offset := c.QueryInt("offset", 0)
+	search := c.Query("search", "")
+	categoryID := c.QueryInt("category_id", 0)
 
-	// 내가 ACTIVE 멤버로 속한 워크스페이스 조회
-	err := h.db.
+	var workspaces []model.Workspace
+	var total int64
+
+	// 기본 쿼리: 내가 ACTIVE 멤버로 속한 워크스페이스
+	query := h.db.Model(&model.Workspace{}).
 		Joins("JOIN workspace_members ON workspace_members.workspace_id = workspaces.id").
-		Where("workspace_members.user_id = ? AND workspace_members.status = ?", claims.UserID, model.MemberStatusActive.String()).
+		Where("workspace_members.user_id = ? AND workspace_members.status = ?", claims.UserID, model.MemberStatusActive.String())
+
+	// 검색 필터
+	if search != "" {
+		query = query.Where("workspaces.name ILIKE ?", "%"+search+"%")
+	}
+
+	// 카테고리 필터
+	if categoryID > 0 {
+		query = query.Joins("JOIN workspace_category_mappings ON workspace_category_mappings.workspace_id = workspaces.id").
+			Where("workspace_category_mappings.category_id = ? AND workspace_category_mappings.user_id = ?", categoryID, claims.UserID)
+	}
+
+	// 전체 개수 조회
+	if err := query.Count(&total).Error; err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+			"error": "failed to count workspaces",
+		})
+	}
+
+	// 정렬 및 페이지네이션
+	query = query.Order("workspaces.created_at DESC")
+	if limit > 0 {
+		query = query.Limit(limit).Offset(offset)
+	}
+
+	// 데이터 조회
+	err := query.
 		Preload("Owner").
 		Preload("Members", "status = ?", model.MemberStatusActive.String()).
 		Preload("Members.User").
 		Preload("Members.Role").
 		Preload("Members.Role.Permissions").
-		Order("workspaces.created_at DESC").
 		Find(&workspaces).Error
 
 	if err != nil {
@@ -217,14 +252,38 @@ func (h *WorkspaceHandler) GetMyWorkspaces(c *fiber.Ctx) error {
 		})
 	}
 
+	// 워크스페이스 ID 목록 추출
+	workspaceIDs := make([]int64, len(workspaces))
+	for i, ws := range workspaces {
+		workspaceIDs[i] = ws.ID
+	}
+
+	// 카테고리 매핑 조회
+	categoryMap := make(map[int64][]int64) // workspaceID -> []categoryID
+	if len(workspaceIDs) > 0 {
+		var mappings []model.WorkspaceCategoryMapping
+		h.db.Where("workspace_id IN ? AND user_id = ?", workspaceIDs, claims.UserID).Find(&mappings)
+		for _, m := range mappings {
+			categoryMap[m.WorkspaceID] = append(categoryMap[m.WorkspaceID], m.CategoryID)
+		}
+	}
+
 	responses := make([]WorkspaceResponse, len(workspaces))
 	for i, ws := range workspaces {
 		responses[i] = h.toWorkspaceResponse(&ws)
+		responses[i].CategoryIDs = categoryMap[ws.ID]
+	}
+
+	// has_more 계산
+	hasMore := false
+	if limit > 0 {
+		hasMore = int64(offset+len(workspaces)) < total
 	}
 
 	return c.JSON(fiber.Map{
 		"workspaces": responses,
-		"total":      len(responses),
+		"total":      total,
+		"has_more":   hasMore,
 	})
 }
 
@@ -276,7 +335,7 @@ func (h *WorkspaceHandler) GetWorkspace(c *fiber.Ctx) error {
 				// 기본 권한 설정
 				defaultRole.Permissions = []model.RolePermission{
 					{PermissionCode: "SEND_MESSAGES"},
-					{PermissionCode: "CONNECT_VOICE"},
+					{PermissionCode: "CONNECT_MEDIA"},
 				}
 				if err := h.db.Create(&defaultRole).Error; err != nil {
 					log.Printf("warning: failed to create default role for workspace %d: %v", workspace.ID, err)
@@ -345,19 +404,13 @@ func (h *WorkspaceHandler) AddMembers(c *fiber.Ctx) error {
 		})
 	}
 
-	// 멤버인지 확인
-	isMember := false
-	for _, member := range workspace.Members {
-		if member.UserID == claims.UserID && member.Status == model.MemberStatusActive.String() {
-			isMember = true
-			break
-		}
+	// 권한 확인 (MANAGE_MEMBERS)
+	hasPermission, err := auth.CheckPermission(h.db, int64(workspaceID), claims.UserID, "MANAGE_MEMBERS")
+	if err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to check permission"})
 	}
-
-	if !isMember {
-		return c.Status(fiber.StatusForbidden).JSON(fiber.Map{
-			"error": "you are not a member of this workspace",
-		})
+	if !hasPermission {
+		return c.Status(fiber.StatusForbidden).JSON(fiber.Map{"error": "you do not have permission to add members"})
 	}
 
 	// 기존 멤버 ID 맵 (ACTIVE + PENDING 모두)
@@ -546,8 +599,13 @@ func (h *WorkspaceHandler) UpdateWorkspace(c *fiber.Ctx) error {
 		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "workspace not found"})
 	}
 
-	if workspace.OwnerID != claims.UserID {
-		return c.Status(fiber.StatusForbidden).JSON(fiber.Map{"error": "only owner can update workspace"})
+	// 권한 확인 (ADMIN)
+	hasPermission, err := auth.CheckPermission(h.db, int64(workspaceID), claims.UserID, "ADMIN")
+	if err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to check permission"})
+	}
+	if !hasPermission {
+		return c.Status(fiber.StatusForbidden).JSON(fiber.Map{"error": "you do not have permission to update workspace"})
 	}
 
 	workspace.Name = sanitizeString(req.Name)
@@ -566,14 +624,26 @@ func (h *WorkspaceHandler) DeleteWorkspace(c *fiber.Ctx) error {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid workspace id"})
 	}
 
+	// [Debug] Log deletion attempt
+	log.Printf("Deleting workspace: ID=%d, UserID=%d", workspaceID, claims.UserID)
+
 	var workspace model.Workspace
 	if err := h.db.First(&workspace, workspaceID).Error; err != nil {
-		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "workspace not found"})
+		log.Printf("Workspace not found for deletion: ID=%d, Error=%v", workspaceID, err)
+		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": fmt.Sprintf("workspace %d not found: %v", workspaceID, err)})
 	}
 
-	if workspace.OwnerID != claims.UserID {
-		return c.Status(fiber.StatusForbidden).JSON(fiber.Map{"error": "only owner can delete workspace"})
+	// 권한 확인 (ADMIN)
+	hasPermission, err := auth.CheckPermission(h.db, int64(workspaceID), claims.UserID, "ADMIN")
+	if err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to check permission"})
 	}
+	if !hasPermission {
+		return c.Status(fiber.StatusForbidden).JSON(fiber.Map{"error": "you do not have permission to delete workspace"})
+	}
+
+	// [Debug] Permission checked
+	log.Printf("Permission checked for deletion: ID=%d, UserID=%d", workspaceID, claims.UserID)
 
 	// Soft Delete or Hard Delete? GORM default Delete is Soft Delete if DeletedAt field exists.
 	// Workspace struct does not have DeletedAt yet (based on previous view), so checking entity.go.
@@ -624,11 +694,13 @@ func (h *WorkspaceHandler) UpdateMemberRole(c *fiber.Ctx) error {
 		})
 	}
 
-	// 권한 확인 (워크스페이스 소유자만 허용)
-	if workspace.OwnerID != claims.UserID {
-		return c.Status(fiber.StatusForbidden).JSON(fiber.Map{
-			"error": "only workspace owner can update member roles",
-		})
+	// 권한 확인
+	hasPermission, err := auth.CheckPermission(h.db, int64(workspaceID), claims.UserID, "MANAGE_MEMBERS")
+	if err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to check permission"})
+	}
+	if !hasPermission {
+		return c.Status(fiber.StatusForbidden).JSON(fiber.Map{"error": "you do not have permission to update member roles"})
 	}
 
 	// 멤버 조회
@@ -662,4 +734,46 @@ func (h *WorkspaceHandler) UpdateMemberRole(c *fiber.Ctx) error {
 	return c.JSON(fiber.Map{
 		"message": "member role updated",
 	})
+}
+
+// KickMember 멤버 추방
+func (h *WorkspaceHandler) KickMember(c *fiber.Ctx) error {
+	claims := c.Locals("claims").(*auth.Claims)
+	workspaceID, err := c.ParamsInt("id")
+	if err != nil {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid workspace id"})
+	}
+	userID, err := c.ParamsInt("userId")
+	if err != nil {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid user id"})
+	}
+
+	// 권한 확인
+	hasPermission, err := auth.CheckPermission(h.db, int64(workspaceID), claims.UserID, "MANAGE_MEMBERS")
+	if err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to check permission"})
+	}
+	if !hasPermission {
+		return c.Status(fiber.StatusForbidden).JSON(fiber.Map{"error": "you do not have permission to kick members"})
+	}
+
+	// 추방 대상 멤버 조회
+	var member model.WorkspaceMember
+	if err := h.db.Where("workspace_id = ? AND user_id = ?", workspaceID, userID).First(&member).Error; err != nil {
+		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "member not found"})
+	}
+
+	// 소유자는 추방 불가능
+	var workspace model.Workspace
+	h.db.First(&workspace, workspaceID)
+	if workspace.OwnerID == int64(userID) {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "cannot kick the owner"})
+	}
+
+	// 멤버 추방
+	if err := h.db.Delete(&member).Error; err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to kick member"})
+	}
+
+	return c.JSON(fiber.Map{"message": "member kicked successfully"})
 }

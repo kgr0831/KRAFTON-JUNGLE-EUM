@@ -7,6 +7,10 @@ interface AuthResponse {
     nickname: string;
     profile_img?: string;
     provider?: string;
+    default_status?: string;
+    custom_status_text?: string;
+    custom_status_emoji?: string;
+    custom_status_expires_at?: string;
   };
   expires_in: number;
 }
@@ -16,6 +20,9 @@ interface UserSearchResult {
   email: string;
   nickname: string;
   profile_img?: string;
+  default_status?: string;
+  custom_status_text?: string;
+  custom_status_emoji?: string;
 }
 
 interface SearchUsersResponse {
@@ -47,11 +54,41 @@ interface Workspace {
   created_at: string;
   owner?: UserSearchResult;
   members?: WorkspaceMember[];
+  category_ids?: number[];
 }
 
 interface WorkspacesResponse {
   workspaces: Workspace[];
   total: number;
+  has_more?: boolean;
+}
+
+// 워크스페이스 카테고리 관련 타입
+interface WorkspaceCategory {
+  id: number;
+  user_id: number;
+  name: string;
+  color: string;
+  sort_order: number;
+  created_at: string;
+  workspace_count?: number;
+}
+
+interface WorkspaceCategoriesResponse {
+  categories: WorkspaceCategory[];
+  total: number;
+}
+
+interface CreateCategoryRequest {
+  name: string;
+  color?: string;
+}
+
+interface WorkspacesQueryParams {
+  limit?: number;
+  offset?: number;
+  search?: string;
+  category_id?: number;
 }
 
 interface CreateWorkspaceRequest {
@@ -103,6 +140,14 @@ interface ChatRoomMessagesResponse {
   room_id: number;
   messages: ChatMessage[];
   total: number;
+}
+
+export interface DMRoom {
+  id: number;
+  target_user: UserSearchResult;
+  last_message?: string;
+  unread_count: number;
+  updated_at: string;
 }
 
 // 미팅 관련 타입
@@ -261,6 +306,25 @@ interface CreateVoiceRecordBulkRequest {
   records: CreateVoiceRecordRequest[];
 }
 
+// 실시간 음성 기록 (Redis 기반)
+interface RoomTranscript {
+  roomId: string;
+  speakerId: string;
+  speakerName: string;
+  original: string;
+  translated?: string;
+  sourceLang: string;
+  targetLang?: string;
+  isFinal: boolean;
+  timestamp: string;
+}
+
+interface RoomTranscriptsResponse {
+  roomId: string;
+  transcripts: RoomTranscript[];
+  count: number;
+}
+
 // HTTP-only 쿠키 기반 인증 (XSS 방지)
 class ApiClient {
   private isLoggedIn: boolean = false;
@@ -282,11 +346,20 @@ class ApiClient {
       delete headers['Content-Type'];
     }
 
-    const response = await fetch(`${API_BASE_URL}${endpoint}`, {
-      ...options,
-      headers,
-      credentials: 'include', // 쿠키 자동 전송
-    });
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 10000);
+
+    let response: Response;
+    try {
+      response = await fetch(`${API_BASE_URL}${endpoint}`, {
+        ...options,
+        headers,
+        credentials: 'include',
+        signal: controller.signal,
+      });
+    } finally {
+      clearTimeout(timeoutId);
+    }
 
     if (response.status === 401) {
       // auth 엔드포인트는 자동 갱신 건너뛰기
@@ -313,6 +386,10 @@ class ApiClient {
     if (!response.ok) {
       const error = await response.json().catch(() => ({}));
       throw new Error(error.error || 'Request failed');
+    }
+
+    if (response.status === 204) {
+      return {} as T;
     }
 
     return response.json();
@@ -408,6 +485,19 @@ class ApiClient {
     });
   }
 
+  // 상태 업데이트
+  async updateUserStatus(data: {
+    status?: string;
+    custom_status_text?: string;
+    custom_status_emoji?: string;
+    expires_at?: string;
+  }): Promise<{ message: string }> {
+    return this.request<{ message: string }>('/auth/me/status', {
+      method: 'PUT',
+      body: JSON.stringify(data),
+    });
+  }
+
   // 유저 검색 (닉네임 또는 이메일)
   async searchUsers(query: string): Promise<SearchUsersResponse> {
     if (query.length < 2) {
@@ -426,9 +516,17 @@ class ApiClient {
     });
   }
 
-  // 내 워크스페이스 목록 조회
-  async getMyWorkspaces(): Promise<WorkspacesResponse> {
-    return this.request<WorkspacesResponse>('/api/workspaces/');
+  // 내 워크스페이스 목록 조회 (페이지네이션, 검색 지원)
+  async getMyWorkspaces(params?: WorkspacesQueryParams): Promise<WorkspacesResponse> {
+    const searchParams = new URLSearchParams();
+    if (params?.limit) searchParams.append('limit', params.limit.toString());
+    if (params?.offset) searchParams.append('offset', params.offset.toString());
+    if (params?.search) searchParams.append('search', params.search);
+    if (params?.category_id) searchParams.append('category_id', params.category_id.toString());
+
+    const queryString = searchParams.toString();
+    const url = queryString ? `/api/workspaces/?${queryString}` : '/api/workspaces/';
+    return this.request<WorkspacesResponse>(url);
   }
 
   // 워크스페이스 상세 조회
@@ -451,6 +549,13 @@ class ApiClient {
     });
   }
 
+  // 워크스페이스 멤버 강퇴
+  async kickMember(workspaceId: number, userId: number): Promise<{ message: string }> {
+    return this.request(`/api/workspaces/${workspaceId}/members/${userId}`, {
+      method: 'DELETE',
+    });
+  }
+
   // 워크스페이스 수정
   async updateWorkspace(workspaceId: number, name: string): Promise<Workspace> {
     return this.request<Workspace>(`/api/workspaces/${workspaceId}`, {
@@ -462,6 +567,43 @@ class ApiClient {
   // 워크스페이스 삭제
   async deleteWorkspace(workspaceId: number): Promise<void> {
     await this.request(`/api/workspaces/${workspaceId}`, {
+      method: 'DELETE',
+    });
+  }
+
+  // ========== 워크스페이스 카테고리 API ==========
+  async getMyCategories(): Promise<WorkspaceCategoriesResponse> {
+    return this.request<WorkspaceCategoriesResponse>('/api/workspace-categories');
+  }
+
+  async createCategory(data: CreateCategoryRequest): Promise<WorkspaceCategory> {
+    return this.request<WorkspaceCategory>('/api/workspace-categories', {
+      method: 'POST',
+      body: JSON.stringify(data),
+    });
+  }
+
+  async updateCategory(categoryId: number, data: Partial<CreateCategoryRequest>): Promise<WorkspaceCategory> {
+    return this.request<WorkspaceCategory>(`/api/workspace-categories/${categoryId}`, {
+      method: 'PUT',
+      body: JSON.stringify(data),
+    });
+  }
+
+  async deleteCategory(categoryId: number): Promise<{ message: string }> {
+    return this.request(`/api/workspace-categories/${categoryId}`, {
+      method: 'DELETE',
+    });
+  }
+
+  async addWorkspaceToCategory(categoryId: number, workspaceId: number): Promise<{ message: string }> {
+    return this.request(`/api/workspace-categories/${categoryId}/workspaces/${workspaceId}`, {
+      method: 'POST',
+    });
+  }
+
+  async removeWorkspaceFromCategory(categoryId: number, workspaceId: number): Promise<{ message: string }> {
+    return this.request(`/api/workspace-categories/${categoryId}/workspaces/${workspaceId}`, {
       method: 'DELETE',
     });
   }
@@ -550,6 +692,12 @@ class ApiClient {
     });
   }
 
+  async markChatRoomAsRead(workspaceId: number, roomId: number): Promise<{ message: string; read_at: string }> {
+    return this.request(`/api/workspaces/${workspaceId}/chatrooms/${roomId}/read`, {
+      method: 'POST',
+    });
+  }
+
   // ========== 미팅 API ==========
   async getWorkspaceMeetings(workspaceId: number): Promise<MeetingsResponse> {
     return this.request<MeetingsResponse>(`/api/workspaces/${workspaceId}/meetings`);
@@ -564,6 +712,18 @@ class ApiClient {
 
   async getMeeting(workspaceId: number, meetingId: number): Promise<Meeting> {
     return this.request<Meeting>(`/api/workspaces/${workspaceId}/meetings/${meetingId}`);
+  }
+
+  // ========== DM API ==========
+  async getOrCreateDMRoom(workspaceId: number, targetUserId: number): Promise<{ id: number }> {
+    return this.request<{ id: number }>(`/api/workspaces/${workspaceId}/dm`, {
+      method: 'POST',
+      body: JSON.stringify({ target_user_id: targetUserId }),
+    });
+  }
+
+  async getMyDMs(workspaceId: number): Promise<DMRoom[]> {
+    return this.request<DMRoom[]>(`/api/workspaces/${workspaceId}/dm`);
   }
 
   async startMeeting(workspaceId: number, meetingId: number): Promise<Meeting> {
@@ -762,6 +922,11 @@ class ApiClient {
     );
   }
 
+  // 실시간 음성 기록 (Redis)
+  async getRoomTranscripts(roomId: string): Promise<RoomTranscriptsResponse> {
+    return this.request<RoomTranscriptsResponse>(`/api/room/${encodeURIComponent(roomId)}/transcripts`);
+  }
+
   async createVoiceRecord(workspaceId: number, meetingId: number, data: CreateVoiceRecordRequest): Promise<VoiceRecord> {
     return this.request<VoiceRecord>(`/api/workspaces/${workspaceId}/meetings/${meetingId}/voice-records`, {
       method: 'POST',
@@ -792,6 +957,11 @@ export type {
   WorkspaceMember,
   WorkspacesResponse,
   CreateWorkspaceRequest,
+  WorkspacesQueryParams,
+  // Category
+  WorkspaceCategory,
+  WorkspaceCategoriesResponse,
+  CreateCategoryRequest,
   // Chat
   ChatMessage,
   ChatsResponse,
@@ -821,4 +991,7 @@ export type {
   VoiceRecord,
   VoiceRecordsResponse,
   CreateVoiceRecordRequest,
+  // Room Transcript (Redis)
+  RoomTranscript,
+  RoomTranscriptsResponse,
 };

@@ -8,23 +8,43 @@ import { apiClient } from '@/app/lib/api';
 
 import { DrawEvent, ClearEvent, RefetchEvent, CursorEvent, WhiteboardTool } from './types';
 import { ZOOM_SETTINGS, GRID_SETTINGS, TOOL_SETTINGS } from './constants';
-import { hexToNumber, generatePenCursor, generateEraserCursor } from './utils';
+import { hexToNumber, generatePenCursor, generateEraserCursor, simplifyPoints, Point, getStrokePoints } from './utils';
 import { useWhiteboardCursors } from './hooks/useWhiteboardCursors';
 import { ZoomControls } from './components/ZoomControls';
-import { RemoteCursors } from './components/RemoteCursors';
+import { RemoteCursors, CursorVisual } from './components/RemoteCursors'; // Import CursorVisual
 import { WhiteboardToolbar } from './components/WhiteboardToolbar';
+
+import { OneEuroFilter } from './oneEuroFilter'; // Import Filter
 
 export default function WhiteboardCanvas() {
     // Refs
     const containerRef = useRef<HTMLDivElement>(null);
+    const localCursorRef = useRef<HTMLDivElement>(null);
     const appRef = useRef<PIXI.Application | null>(null);
     const drawingContainerRef = useRef<PIXI.Container | null>(null);
-    const currentGraphicsRef = useRef<{
+    const currentLocalGraphicsRef = useRef<{
         graphics: PIXI.Graphics;
         color: number;
         width: number;
-        isEraser: boolean;
+        tool: WhiteboardTool;
     } | null>(null);
+
+    const currentRemoteGraphicsRef = useRef<{
+        graphics: PIXI.Graphics;
+        color: number;
+        width: number;
+        tool: WhiteboardTool; // Changed from isEraser to tool
+    } | null>(null);
+
+    // FIX: Lock processing to prevent double-save race conditions
+    // Removed isProcessingRef to fix data loss bug. Using Capture-and-Clear strategy instead.
+
+    // Filters for Jitter Reduction (Phase 2)
+    // minCutoff=1.0 (Hz), beta=0.23 (Response Speed)
+    // TUNING: Aggressive Beta (0.05 -> 0.23) to ELIMINATE lag/squaring on fast circles.
+    // Normalized minCutoff (0.7 -> 1.0) for standard stationary stability.
+    const filterX = useRef(new OneEuroFilter(1.0, 0.23));
+    const filterY = useRef(new OneEuroFilter(1.0, 0.23));
 
     // Tool State
     const toolRef = useRef<WhiteboardTool>('pen');
@@ -54,13 +74,13 @@ export default function WhiteboardCanvas() {
     const [isMiddlePanning, setIsMiddlePanning] = useState(false);
     const [isDrawing, setIsDrawing] = useState(false);
     const [triggerLoad, setTriggerLoad] = useState(0);
-
-    // LiveKit
+    const [isReady, setIsReady] = useState(false);
+    const [isHoveringToolbar, setIsHoveringToolbar] = useState(false); // Track toolbar hover
     const room = useRoomContext();
     const participants = useParticipants();
 
     // Cursor Hook - pass tool state for cursor display
-    const { remoteCursors, localCursor, broadcastCursor, handleCursorEvent } = useWhiteboardCursors({
+    const { remoteCursors, broadcastCursor, handleCursorEvent, cursorColor } = useWhiteboardCursors({ // Destructure cursorColor, remove localCursor
         room,
         participantIdentities: participants.filter(p => !p.isLocal).map(p => p.identity),
         toolState: {
@@ -70,32 +90,107 @@ export default function WhiteboardCanvas() {
         },
     });
 
-    // Drawing function
+    // Smoothing Helper: Quadratic Bezier Interpolation
+    const drawSmoothStroke = (graphics: PIXI.Graphics, points: { x: number, y: number }[], width: number, color: number, isMagic: boolean = false) => {
+        if (points.length === 0) return;
+
+        // Build Path
+        const buildPath = () => {
+            // FIX: Don't smooth simple polygons (Rectangles/Triangles have < 10 points)
+            // If we smooth a 5-point rectangle, it becomes a blob.
+            if (points.length < 10) {
+                graphics.moveTo(points[0].x, points[0].y);
+                for (let i = 1; i < points.length; i++) {
+                    graphics.lineTo(points[i].x, points[i].y);
+                }
+            } else {
+                graphics.moveTo(points[0].x, points[0].y);
+                // Draw curves between midpoints
+                for (let i = 1; i < points.length - 1; i++) {
+                    const p1 = points[i];
+                    const p2 = points[i + 1];
+                    const midX = (p1.x + p2.x) / 2;
+                    const midY = (p1.y + p2.y) / 2;
+                    graphics.quadraticCurveTo(p1.x, p1.y, midX, midY);
+                }
+                // Connect to last point
+                const last = points[points.length - 1];
+                graphics.lineTo(last.x, last.y);
+            }
+        };
+
+        if (isMagic) {
+            // Draw Halo (Thick, semitransparent)
+            // User Request: Maintain effect even when thick.
+            // Strategy: Use multiplier (x3) instead of fixed offset to scale effect with thickness.
+            graphics.setStrokeStyle({
+                width: width * 3, // Proportional scaling
+                color: color,
+                alpha: 0.15,
+                cap: 'round',
+                join: 'round'
+            });
+            buildPath();
+            graphics.stroke();
+
+            // Draw Core (Normal)
+            graphics.setStrokeStyle({
+                width,
+                color,
+                alpha: 1,
+                cap: 'round',
+                join: 'round'
+            });
+            buildPath(); // Rebuild path for second stroke
+            graphics.stroke();
+        } else {
+            graphics.setStrokeStyle({
+                width,
+                color,
+                alpha: 1,
+                cap: 'round',
+                join: 'round'
+            });
+            buildPath();
+            graphics.stroke();
+        }
+    };
+
+    // Drawing function (Legacy/Remote wrapper)
     const drawLine = useCallback((x: number, y: number, prevX: number, prevY: number, color: number, width: number) => {
+        // NOTE: This single-segment (prev->curr) drawLine is only for legacy/remote stream fallback.
+        // It cannot smooth effectively because it only knows 2 points. 
+        // Real smoothing happens in onPointerMove (local) and loadHistory/batch (arrays).
         if (!drawingContainerRef.current) return;
 
+        // DEBUG: Trace remote drawing
+        console.log('[WhiteboardCanvas] drawLine called. Color:', color.toString(16), 'Width:', width);
+
         const isEraser = color === 0xffffff;
+        // Legacy drawer doesn't support Magic Pen styles yet (or we infer from context?)
+        // For now, treat as pen.
 
         let graphics: PIXI.Graphics;
-        const sameProp = currentGraphicsRef.current &&
-            currentGraphicsRef.current.color === color &&
-            currentGraphicsRef.current.width === width &&
-            currentGraphicsRef.current.isEraser === isEraser;
+        const sameProp = currentRemoteGraphicsRef.current &&
+            currentRemoteGraphicsRef.current.color === color &&
+            currentRemoteGraphicsRef.current.width === width &&
+            ((isEraser && currentRemoteGraphicsRef.current.tool === 'eraser') || (!isEraser && currentRemoteGraphicsRef.current.tool !== 'eraser'));
 
-        if (sameProp && currentGraphicsRef.current) {
-            graphics = currentGraphicsRef.current.graphics;
+        if (sameProp && currentRemoteGraphicsRef.current) {
+            graphics = currentRemoteGraphicsRef.current.graphics;
         } else {
             graphics = new PIXI.Graphics();
             if (isEraser) {
-                graphics.blendMode = 'erase';
+                // FIX: Use 'dst-out' for Eraser in WebGPU to correctly punch holes
+                graphics.blendMode = 'dst-out' as any;
             }
             drawingContainerRef.current.addChild(graphics);
 
-            currentGraphicsRef.current = {
+            currentRemoteGraphicsRef.current = {
                 graphics,
                 color,
                 width,
-                isEraser,
+                tool: isEraser ? 'eraser' : 'pen',
             };
         }
 
@@ -103,6 +198,17 @@ export default function WhiteboardCanvas() {
         graphics.lineTo(x, y);
         graphics.stroke({ width, color, cap: 'round', join: 'round' });
     }, []);
+
+    // Stable references for event listeners to avoid re-init
+    const broadcastCursorRef = useRef(broadcastCursor);
+    const drawLineRef = useRef(drawLine);
+
+    useEffect(() => {
+        broadcastCursorRef.current = broadcastCursor;
+        drawLineRef.current = drawLine;
+    }, [broadcastCursor, drawLine]);
+
+    // Debug tracking removed
 
     // PIXI initialization
     useEffect(() => {
@@ -120,6 +226,9 @@ export default function WhiteboardCanvas() {
         let isDrawing = false;
         let isPanning = false;
         let lastPanPoint: { x: number; y: number } | null = null;
+        let dragStartPoint: { x: number; y: number } | null = null;
+        let lockedAxis: 'x' | 'y' | null = null;
+        let driftOffset = { x: 0, y: 0 };
         let canvasElement: HTMLCanvasElement | null = null;
         let prevRawPoint: { x: number; y: number } | null = null;
         let prevRenderedPoint: { x: number; y: number } | null = null;
@@ -156,6 +265,11 @@ export default function WhiteboardCanvas() {
         const onPointerDown = (e: PointerEvent) => {
             if (!canvasElement) return;
 
+            // Fix: Blur any active inputs (like color picker) when touching canvas
+            if (document.activeElement instanceof HTMLElement) {
+                document.activeElement.blur();
+            }
+
             setIsInteracting(true);
             canvasElement.setPointerCapture(e.pointerId);
 
@@ -170,6 +284,18 @@ export default function WhiteboardCanvas() {
             isDrawing = true;
             setIsDrawing(true);
             const startPoint = getLocalPoint(e.clientX, e.clientY);
+            // Capture start point for orthogonal drawing (Shift key)
+            dragStartPoint = startPoint;
+            lockedAxis = null;
+            driftOffset = { x: 0, y: 0 };
+
+            // Phase 2: Input Stabilization - Reset Filters
+            filterX.current.reset();
+            filterY.current.reset();
+            // Prime the filter with initial value
+            filterX.current.filter(startPoint.x, Date.now());
+            filterY.current.filter(startPoint.y, Date.now());
+
             prevRawPoint = startPoint;
             prevRenderedPoint = startPoint;
             currentStroke = [];
@@ -178,9 +304,17 @@ export default function WhiteboardCanvas() {
         const onPointerMove = (e: PointerEvent) => {
             if (!canvasElement) return;
 
-            // Broadcast cursor position
+            // Broadcast cursor position (networking)
             const cursorPoint = getLocalPoint(e.clientX, e.clientY);
-            broadcastCursor(cursorPoint.x, cursorPoint.y);
+            // Use REF to avoid dependency
+            broadcastCursorRef.current(cursorPoint.x, cursorPoint.y);
+
+            // FIX: Ensure Magic Pen tool state is broadcast correctly via cursor or context
+            // Currently broadcastCursor uses toolState from hook, which updates on state change.
+            // But we need to make sure 'magic-pen' is treated as a drawing tool.
+
+
+            // (Local cursor update moved below to use stabilized/constrained point)
 
             if (isPanning && lastPanPoint) {
                 const dx = e.clientX - lastPanPoint.x;
@@ -199,33 +333,105 @@ export default function WhiteboardCanvas() {
 
             if (!isDrawing || !prevRawPoint || !prevRenderedPoint) return;
 
-            const rawPoint = getLocalPoint(e.clientX, e.clientY);
-            const sLevel = smoothnessRef.current;
+            const currentRaw = getLocalPoint(e.clientX, e.clientY);
 
-            const dist = Math.sqrt(
-                Math.pow(rawPoint.x - prevRawPoint.x, 2) +
-                Math.pow(rawPoint.y - prevRawPoint.y, 2)
-            );
+            // Apply existing drift offset
+            const rawPoint = {
+                x: currentRaw.x + driftOffset.x,
+                y: currentRaw.y + driftOffset.y
+            };
 
-            const distThresholdScreen = sLevel === 0 ? 0 : 0.5 + (sLevel * 0.5);
-            const threshold = distThresholdScreen / scaleRef.current;
+            // Shift Key: Straight Line Constraint (Orthogonal)
+            if (toolRef.current === 'pen' && isDrawing && dragStartPoint) {
+                // Feature: Freeze drawing if Shift is released mid-stroke (Prevent "Tail")
+                if (lockedAxis && !e.shiftKey) {
+                    return;
+                }
 
-            if (dist < threshold) return;
+                // 1. Engage Lock if Shift is pressed and not yet locked
+                if (e.shiftKey && !lockedAxis) {
+                    const dx = Math.abs(currentRaw.x - dragStartPoint.x);
+                    const dy = Math.abs(currentRaw.y - dragStartPoint.y);
 
-            let targetPoint = rawPoint;
-            if (sLevel > 0) {
-                targetPoint = {
-                    x: (prevRawPoint.x + rawPoint.x) / 2,
-                    y: (prevRawPoint.y + rawPoint.y) / 2,
-                };
+                    // Threshold to prevent accidental locking on micro-movements (optional, but good practice)
+                    if (Math.hypot(dx, dy) > 5) {
+                        if (dx > dy) {
+                            lockedAxis = 'y'; // Lock Y axis (Horizontal movement)
+                        } else {
+                            lockedAxis = 'x'; // Lock X axis (Vertical movement)
+                        }
+                    }
+                }
+
+                // 2. Apply Lock (Persistent until PointerUp)
+                if (lockedAxis === 'y') {
+                    const constrainedY = dragStartPoint.y;
+                    driftOffset.y = constrainedY - currentRaw.y;
+                    rawPoint.y = constrainedY;
+                } else if (lockedAxis === 'x') {
+                    const constrainedX = dragStartPoint.x;
+                    driftOffset.x = constrainedX - currentRaw.x;
+                    rawPoint.x = constrainedX;
+                }
             }
+
+            // Phase 2: Input Stabilization (One Euro Filter)
+            // DYNAMIC TUNING based on "Natural" (sLevel: 0~10) slider
+            // RE-TUNED: Constrained range to prevent "Angularity/Squaring" at max level.
+            // 0 (Fast/Raw): beta=0.8, cutoff=1.5 (Almost raw input)
+            // 10 (Natural/Smooth): beta=0.1, cutoff=0.5 (Stabilized but responsive enough to avoid squares)
+            const sLevel = smoothnessRef.current; // 0 ~ 10
+
+            // Linear Interpolation
+            // Beta: 0.8 -> 0.1
+            const newBeta = 0.8 - (sLevel / 10) * (0.8 - 0.1);
+            // Cutoff: 1.5 -> 0.5
+            const newCutoff = 1.5 - (sLevel / 10) * (1.5 - 0.5);
+
+            // Apply params
+            if (filterX.current && filterY.current) {
+                filterX.current.beta = newBeta;
+                filterX.current.minCutoff = newCutoff;
+                filterY.current.beta = newBeta;
+                filterY.current.minCutoff = newCutoff;
+            }
+
+            const now = Date.now();
+            const stabilizedX = filterX.current.filter(rawPoint.x, now);
+            const stabilizedY = filterY.current.filter(rawPoint.y, now);
+
+            // Use stabilized point for rendering
+            const targetPoint = { x: stabilizedX, y: stabilizedY };
+
+            // Update local cursor visual to match targetPoint (Virtual Cursor)
+            // This ensures the cursor visually snaps to the constrained line and follows the offset.
+            if (localCursorRef.current && drawingContainerRef.current) {
+                // Convert World (targetPoint) back to Screen (Client) for CSS Transform
+                // formula: screen = world * scale + pan + rect
+                const rect = containerRef.current!.getBoundingClientRect();
+                const screenX = (targetPoint.x * scaleRef.current) + panOffsetRef.current.x; // Relative to container
+                const screenY = (targetPoint.y * scaleRef.current) + panOffsetRef.current.y;
+
+                // localCursorRef is likely absolute positioned within container or body?
+                // If containerRef relative: transform is (screenX, screenY).
+                // Original logic was e.clientX - rect.left.
+
+                localCursorRef.current.style.transform = `translate(${screenX}px, ${screenY}px)`;
+            }
+
+            /* Legacy mid-point logic removed */
 
             const color = toolRef.current === 'eraser' ? 0xffffff : penColorRef.current;
             const baseSize = toolRef.current === 'eraser' ? eraserSizeRef.current : penSizeRef.current;
+            // FIX: Revert to Screen-Constant Sizing.
+            // Width is calculated so that it renders as 'baseSize' pixels on screen regardless of zoom.
             const width = baseSize / scaleRef.current;
 
-            drawLine(targetPoint.x, targetPoint.y, prevRenderedPoint.x, prevRenderedPoint.y, color, width);
+            // **NEW: Polygon Rendering for Active Stroke**
+            if (!drawingContainerRef.current) return;
 
+            // 1. Add new point to stroke data
+            // We need to store the points to regenerate the polygon
             const event: DrawEvent = {
                 type: 'draw',
                 x: targetPoint.x,
@@ -235,14 +441,63 @@ export default function WhiteboardCanvas() {
                 color,
                 width,
             };
+            currentStroke.push(event);
 
-            if (room) {
-                const str = JSON.stringify(event);
-                const encoder = new TextEncoder();
-                room.localParticipant.publishData(encoder.encode(str), { reliable: true });
+            // 2. Prepare Graphics
+            let graphics: PIXI.Graphics;
+            if (currentLocalGraphicsRef.current) {
+                graphics = currentLocalGraphicsRef.current.graphics;
+            } else {
+                graphics = new PIXI.Graphics();
+                if (toolRef.current === 'eraser') {
+                    // FIX: Use 'dst-out' instead of 'erase' for WebGPU compatibility
+                    graphics.blendMode = 'dst-out' as any;
+                }
+                drawingContainerRef.current.addChild(graphics);
+                currentLocalGraphicsRef.current = {
+                    graphics,
+                    color,
+                    width,
+                    tool: toolRef.current
+                };
             }
 
-            currentStroke.push(event);
+            // 3. Clear and Redraw Polygon / Polyline
+            graphics.clear();
+
+            const isEraser = toolRef.current === 'eraser';
+
+            if (isEraser) {
+                // ERASER: Use Polyline (Simple Stroke) for stability
+                if (currentStroke.length > 0) {
+                    graphics.setStrokeStyle({
+                        width: width,
+                        color: color,
+                        alpha: 1,
+                        cap: 'round',
+                        join: 'round'
+                    });
+
+                    graphics.moveTo(currentStroke[0].x, currentStroke[0].y);
+                    for (let i = 1; i < currentStroke.length; i++) {
+                        graphics.lineTo(currentStroke[i].x, currentStroke[i].y);
+                    }
+                    graphics.stroke();
+                }
+            } else {
+                // Use Smooth Bezier Polyline
+                if (currentStroke.length > 0) {
+                    // Extract points
+                    const points = currentStroke.map(p => ({ x: p.x, y: p.y }));
+                    drawSmoothStroke(graphics, points, width, color, toolRef.current === 'magic-pen');
+                }
+            }
+
+            // 4. Batching for Remote (Legacy Segment)
+            if (room) {
+                pointBufferRef.current.push(event);
+            }
+
             prevRenderedPoint = targetPoint;
             prevRawPoint = rawPoint;
         };
@@ -262,14 +517,46 @@ export default function WhiteboardCanvas() {
             }
 
             if (isDrawing && prevRawPoint && prevRenderedPoint) {
-                const finalRaw = getLocalPoint(e.clientX, e.clientY);
-                const dest = finalRaw;
+                let dest: { x: number; y: number };
+
+                // Feature: Freeze on Shift Release (Prevent Tail on Up)
+                // If we were locked but Shift is gone, use the LAST RENDERED point.
+                // Do NOT use current mouse position (which has jumped).
+                if (lockedAxis && !e.shiftKey) {
+                    dest = { ...prevRenderedPoint };
+                } else {
+                    const finalRaw = getLocalPoint(e.clientX, e.clientY);
+
+                    // Apply Drift if locked (Shift held)
+                    if (lockedAxis) {
+                        finalRaw.x += driftOffset.x;
+                        finalRaw.y += driftOffset.y;
+
+                        // Re-apply lock constraint specifically for the final point
+                        // (Though driftOffset usually handles it, explicit lock is safer)
+                        if (lockedAxis === 'y') finalRaw.y = dragStartPoint!.y;
+                        else if (lockedAxis === 'x') finalRaw.x = dragStartPoint!.x;
+                    }
+
+                    // Phase 2: Stabilize final point
+                    const now = Date.now();
+                    const stabilizedX = filterX.current.filter(finalRaw.x, now);
+                    const stabilizedY = filterY.current.filter(finalRaw.y, now);
+                    dest = { x: stabilizedX, y: stabilizedY };
+                }
+
+                // Handle single click (dot) - if no movement occurred, offset slightly to force render
+                if (currentStroke.length === 0 && dest.x === prevRenderedPoint.x && dest.y === prevRenderedPoint.y) {
+                    dest = { x: dest.x + 0.1, y: dest.y };
+                }
 
                 const color = toolRef.current === 'eraser' ? 0xffffff : penColorRef.current;
                 const baseSize = toolRef.current === 'eraser' ? eraserSizeRef.current : penSizeRef.current;
+                // FIX: Revert to Screen-Constant Sizing.
                 const width = baseSize / scaleRef.current;
 
-                drawLine(dest.x, dest.y, prevRenderedPoint.x, prevRenderedPoint.y, color, width);
+                // Use REF (Stable)
+                drawLineRef.current(dest.x, dest.y, prevRenderedPoint.x, prevRenderedPoint.y, color, width);
 
                 const event: DrawEvent = {
                     type: 'draw',
@@ -282,31 +569,162 @@ export default function WhiteboardCanvas() {
                 };
 
                 if (room) {
-                    const str = JSON.stringify(event);
-                    const encoder = new TextEncoder();
-                    room.localParticipant.publishData(encoder.encode(str), { reliable: true });
+                    // Batching: Push to buffer
+                    pointBufferRef.current.push(event);
                 }
                 currentStroke.push(event);
             }
+
+            // Capture graphics reference BEFORE clearing state
+            const activeGraphics = currentLocalGraphicsRef.current;
 
             isDrawing = false;
             setIsDrawing(false);
             prevRawPoint = null;
             prevRenderedPoint = null;
-            currentGraphicsRef.current = null;
+            currentLocalGraphicsRef.current = null;
 
-            if (currentStroke.length > 0) {
+            // FIX: Capture and Clear immediately to prevent Race Conditions without blocking data
+            const strokeToProcess = [...currentStroke];
+            currentStroke = [];
+
+            if (strokeToProcess.length > 0) {
                 try {
-                    const data = await apiClient.handleWhiteboardAction(room.name, { stroke: currentStroke });
+                    let eventsToSend = strokeToProcess;
+                    const isMagic = toolRef.current === 'magic-pen';
+
+                    if (isMagic) {
+                        // **MAGIC PEN LOGIC: "Guess or Die"**
+                        const abortMagic = () => {
+                            if (activeGraphics) activeGraphics.graphics.clear();
+                            // NO NEED TO CLEAR currentStroke here (it's local now)
+                        };
+
+                        // 1. Too short? Vanish.
+                        if (strokeToProcess.length <= 10) {
+                            abortMagic();
+                            return;
+                        }
+
+                        // 1.5. Too small? Vanish (Prevent "Water Droplet" / Noise)
+                        const minX = Math.min(...strokeToProcess.map(p => p.x));
+                        const maxX = Math.max(...strokeToProcess.map(p => p.x));
+                        const minY = Math.min(...strokeToProcess.map(p => p.y));
+                        const maxY = Math.max(...strokeToProcess.map(p => p.y));
+
+                        // Increased threshold to 50px to aggressively filter "Ghost/Bounce" strokes
+                        if ((maxX - minX < 50) && (maxY - minY < 50)) {
+                            console.log('[Magic Pen] Stroke too small (<50px). Vanishing.');
+                            abortMagic();
+                            return;
+                        }
+
+                        // 2. Detect Shape
+                        const points = strokeToProcess.map(p => ({ x: p.x, y: p.y }));
+                        const { detectShape } = await import('./shapeRecognition');
+                        const result = detectShape(points);
+
+                        // 3. Not recognized? Vanish.
+                        if (result.type === 'none' || !result.correctedPoints) {
+                            console.log('[Magic Pen] Unrecognized shape. Vanishing.');
+                            abortMagic();
+                            return;
+                        }
+
+                        // 4. Success! Transform and Redraw.
+                        console.log(`[Shape Recognition] Detected ${result.type} (Score: ${result.score.toFixed(2)})`);
+
+                        // A. Clear the "Halo" (Rough stroke)
+                        if (activeGraphics) activeGraphics.graphics.clear();
+
+                        // B. Prepare Events for History/Server
+                        const newEvents: DrawEvent[] = [];
+                        const color = strokeToProcess[0].color;
+                        const width = strokeToProcess[0].width;
+                        const corrected = result.correctedPoints;
+
+                        for (let i = 0; i < corrected.length; i++) {
+                            const prev = i === 0 ? corrected[0] : corrected[i - 1];
+                            newEvents.push({
+                                type: 'draw',
+                                x: corrected[i].x,
+                                y: corrected[i].y,
+                                prevX: prev.x,
+                                prevY: prev.y,
+                                color,
+                                width
+                            });
+                        }
+                        eventsToSend = newEvents;
+
+                        // C. Draw Clean Shape Locally (Immediate Feedback)
+                        if (activeGraphics) {
+                            const g = activeGraphics.graphics;
+                            g.setStrokeStyle({
+                                width,
+                                color,
+                                alpha: 1,
+                                cap: 'round',
+                                join: 'round'
+                            });
+                            g.moveTo(corrected[0].x, corrected[0].y);
+                            for (let i = 1; i < corrected.length; i++) {
+                                g.lineTo(corrected[i].x, corrected[i].y);
+                            }
+                            g.stroke();
+                        }
+
+                    } else {
+                        // **NORMAL PEN LOGIC**
+                        // Apply Douglas-Peucker Simplification for optimization
+                        const originalEvents = strokeToProcess;
+
+                        if (originalEvents.length > 2) {
+                            const points: Point[] = [
+                                { x: originalEvents[0].prevX, y: originalEvents[0].prevY },
+                                ...originalEvents.map(e => ({ x: e.x, y: e.y }))
+                            ];
+                            // TUNING: 0.01 tolerance for high fidelity with decent compression
+                            const tolerance = 0.01;
+                            const simplifiedPoints = simplifyPoints(points, tolerance);
+
+                            if (simplifiedPoints.length >= 2) {
+                                const newEvents: DrawEvent[] = [];
+                                const color = originalEvents[0].color;
+                                const width = originalEvents[0].width;
+
+                                for (let i = 1; i < simplifiedPoints.length; i++) {
+                                    newEvents.push({
+                                        type: 'draw',
+                                        x: simplifiedPoints[i].x,
+                                        y: simplifiedPoints[i].y,
+                                        prevX: simplifiedPoints[i - 1].x,
+                                        prevY: simplifiedPoints[i - 1].y,
+                                        color,
+                                        width
+                                    });
+                                }
+                                eventsToSend = newEvents;
+                            }
+                        }
+                    }
+
+                    const data = await apiClient.handleWhiteboardAction(room.name, { stroke: eventsToSend });
                     if (data.success) {
                         setCanUndo(data.canUndo);
                         setCanRedo(data.canRedo);
+
+                        // FIX: Broadcast refetch to notify others to update their Undo/Redo state
+                        if (room && eventsToSend.length > 0) {
+                            const event: RefetchEvent = { type: 'refetch' };
+                            const encoder = new TextEncoder();
+                            room.localParticipant.publishData(encoder.encode(JSON.stringify(event)), { reliable: true });
+                        }
                     }
                 } catch (err) {
                     console.error('Failed to save stroke:', err);
                 }
             }
-            currentStroke = [];
         };
 
         let resizeObserver: ResizeObserver | null = null;
@@ -344,7 +762,10 @@ export default function WhiteboardCanvas() {
                 canvasElement.addEventListener('pointerdown', onPointerDown);
                 canvasElement.addEventListener('pointermove', onPointerMove);
                 canvasElement.addEventListener('pointerup', onPointerUp);
+                canvasElement.addEventListener('pointerleave', onPointerUp); // Safety: Stop drawing if mouse leaves
                 canvasElement.addEventListener('wheel', onWheel, { passive: false });
+
+                setIsReady(true);
             }
         };
 
@@ -363,13 +784,41 @@ export default function WhiteboardCanvas() {
                     canvas.removeEventListener('pointerdown', onPointerDown);
                     canvas.removeEventListener('pointermove', onPointerMove);
                     canvas.removeEventListener('pointerup', onPointerUp);
+                    canvas.removeEventListener('pointerleave', onPointerUp);
                     canvas.removeEventListener('wheel', onWheel);
                 }
                 appRef.current.destroy(true, { children: true, texture: true });
                 appRef.current = null;
             }
         };
-    }, [room, broadcastCursor, drawLine]);
+        // CRITICAL FIX: Removed broadcastCursor and drawLine from dependency array
+        // Use refs inside instead. This prevents App Reset on drawing start.
+    }, [room]); // Stable dependency only!
+
+    // Batching logic: Flush buffer every 50ms
+    const pointBufferRef = useRef<DrawEvent[]>([]);
+
+    useEffect(() => {
+        if (!room) return;
+
+        const interval = setInterval(() => {
+            if (pointBufferRef.current.length > 0) {
+                const batchEvent = {
+                    type: 'draw_batch',
+                    points: pointBufferRef.current,
+                };
+
+                const str = JSON.stringify(batchEvent);
+                const encoder = new TextEncoder();
+                // Use unreliable for frequent updates if acceptable, but reliable is safer for drawing order
+                room.localParticipant.publishData(encoder.encode(str), { reliable: true });
+
+                pointBufferRef.current = [];
+            }
+        }, 50); // 20fps cap
+
+        return () => clearInterval(interval);
+    }, [room]);
 
     // Data event handler
     useEffect(() => {
@@ -381,13 +830,22 @@ export default function WhiteboardCanvas() {
                 const event = JSON.parse(str);
 
                 if (event.type === 'draw') {
+                    // Legacy support or fallback
                     drawLine(event.x, event.y, event.prevX, event.prevY, event.color, event.width);
+                } else if (event.type === 'draw_batch') {
+                    // Handle batch event
+                    console.log('[WhiteboardCanvas] Recv draw_batch. Points:', event.points.length);
+                    const points = event.points as DrawEvent[];
+                    points.forEach(p => {
+                        drawLine(p.x, p.y, p.prevX, p.prevY, p.color, p.width);
+                    });
                 } else if (event.type === 'clear') {
                     drawingContainerRef.current?.removeChildren();
-                    currentGraphicsRef.current = null;
-                    setCanUndo(false);
-                    setCanRedo(false);
-                    setTriggerLoad(prev => prev + 1);
+                    currentLocalGraphicsRef.current = null;
+                    currentRemoteGraphicsRef.current = null;
+                    // FIX: Don't force disable undo/redo locally. Wait for sync/refetch.
+                    // setCanUndo(false);
+                    // setCanRedo(false);
                 } else if (event.type === 'refetch') {
                     setTriggerLoad(prev => prev + 1);
                 } else if (event.type === 'cursor') {
@@ -406,11 +864,12 @@ export default function WhiteboardCanvas() {
 
     // Load history
     useEffect(() => {
-        if (!room?.name) return;
+        if (!room?.name || !isReady) return;
 
         const loadHistory = async () => {
             try {
                 const data = await apiClient.getWhiteboardHistory(room.name);
+                console.log('[Whiteboard] Loaded history data:', data);
 
                 let history = [];
                 if (Array.isArray(data)) {
@@ -420,17 +879,36 @@ export default function WhiteboardCanvas() {
                     setCanUndo(data.canUndo ?? false);
                     setCanRedo(data.canRedo ?? false);
                 }
+                console.log('[Whiteboard] Parsed history:', history);
 
                 if (drawingContainerRef.current) {
                     drawingContainerRef.current.removeChildren();
                 }
-                currentGraphicsRef.current = null;
+                currentLocalGraphicsRef.current = null;
+                currentRemoteGraphicsRef.current = null;
 
                 history.forEach((stroke: DrawEvent[]) => {
-                    stroke.forEach(point => {
-                        drawLine(point.x, point.y, point.prevX, point.prevY, point.color, point.width);
-                    });
-                    currentGraphicsRef.current = null;
+                    if (stroke.length === 0) return;
+
+                    const firstPoint = stroke[0];
+                    const color = firstPoint.color;
+                    const width = firstPoint.width;
+                    const isEraser = color === 0xffffff;
+
+                    const graphics = new PIXI.Graphics();
+                    if (isEraser) {
+                        graphics.blendMode = 'erase';
+                    }
+
+                    if (isEraser || true) { // FORCE ALL TOOLS TO USE POLYLINE
+                        // Polyline with Smoothing
+                        const points = stroke.map(p => ({ x: p.x, y: p.y }));
+                        drawSmoothStroke(graphics, points, width, color);
+                    }
+
+                    if (drawingContainerRef.current) {
+                        drawingContainerRef.current.addChild(graphics);
+                    }
                 });
             } catch (e) {
                 console.error('Failed to load history', e);
@@ -438,7 +916,7 @@ export default function WhiteboardCanvas() {
         };
 
         loadHistory();
-    }, [room?.name, triggerLoad, drawLine]);
+    }, [room?.name, triggerLoad, drawLine, isReady]);
 
     // Actions
     const setTool = useCallback((t: WhiteboardTool) => {
@@ -449,20 +927,58 @@ export default function WhiteboardCanvas() {
     const clearBoard = useCallback(() => {
         if (drawingContainerRef.current) {
             drawingContainerRef.current.removeChildren();
-            currentGraphicsRef.current = null;
+            currentLocalGraphicsRef.current = null;
+            currentRemoteGraphicsRef.current = null;
         }
         if (room) {
             const event: ClearEvent = { type: 'clear' };
             const encoder = new TextEncoder();
             room.localParticipant.publishData(encoder.encode(JSON.stringify(event)), { reliable: true });
+
+            // FIX: Broadcast 'refetch' to sync state for everyone
+            setTimeout(() => {
+                const refetchEvent: RefetchEvent = { type: 'refetch' };
+                room.localParticipant.publishData(encoder.encode(JSON.stringify(refetchEvent)), { reliable: true });
+            }, 100);
         }
         apiClient.handleWhiteboardAction(room.name, { type: 'clear' })
-            .then(() => {
-                setCanUndo(false);
-                setCanRedo(false);
+            .then((data) => {
+                // FIX: Trust server response
+                setCanUndo(data.canUndo);
+                setCanRedo(data.canRedo);
+                setTriggerLoad(prev => prev + 1); // Local sync
             })
             .catch(err => console.error('Failed to clear board:', err));
     }, [room]);
+
+    // Cursor Update Effect
+    useEffect(() => {
+        if (!containerRef.current) return;
+
+        if (activeTool === 'magic-pen') {
+            // Custom Magic Wand Cursor (SVG Data URI)
+            const wandCursor = `url('data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="black" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m21.64 3.64-1.28-1.28a1.21 1.21 0 0 0-1.72 0L2.36 18.64a1.21 1.21 0 0 0 0 1.72l1.28 1.28a1.2 1.2 0 0 0 1.72 0L21.64 5.36a1.2 1.2 0 0 0 0-1.72Z"/><path d="m14 7 3 3"/><path d="M5 6v4"/><path d="M19 14v4"/><path d="M10 2v2"/><path d="M7 8H3"/><path d="M21 16h-4"/><path d="M11 3H9"/></svg>') 2 2, auto`;
+            containerRef.current.style.cursor = wandCursor;
+        } else if (activeTool === 'eraser') {
+            // Scaled size for cursor
+            const cursorCss = generateEraserCursor(eraserSize);
+            containerRef.current.style.cursor = cursorCss;
+        } else if (activeTool === 'pen') {
+            // Scaled size for cursor
+            const cursorCss = generatePenCursor(penSize, penColor);
+            containerRef.current.style.cursor = cursorCss;
+        } else if (activeTool === 'hand') {
+            containerRef.current.style.cursor = isInteracting ? 'grabbing' : 'grab';
+        } else {
+            containerRef.current.style.cursor = 'default';
+        }
+    }, [activeTool, penSize, eraserSize, penColor, scale, isInteracting]);
+
+    // Initial load
+    useEffect(() => {
+        if (!containerRef.current) return;
+        // Trigger initial cursor update
+    }, []);
 
     const performUndo = useCallback(async () => {
         if (!room?.name || !canUndo) return;
@@ -610,25 +1126,54 @@ export default function WhiteboardCanvas() {
             case 'hand':
                 return 'grab';
             case 'pen':
+                // FIX: Revert to Screen-Constant cursor (always same size on screen)
                 return generatePenCursor(penSize, penColor);
             case 'eraser':
+                // FIX: Revert to Screen-Constant cursor
                 return generateEraserCursor(eraserSize);
             default:
                 return 'default';
         }
     }, [activeTool, isInteracting, isMiddlePanning, penSize, penColor, eraserSize]);
 
+    const handleGlobalPointerMove = (e: React.PointerEvent) => {
+        // Broadcast cursor position (networking)
+        // Note: we might want to throttle this or check bounds if needed, but for now simple
+        // relaying coordinates relative to the container is fine.
+        if (localCursorRef.current && containerRef.current) {
+            const rect = containerRef.current.getBoundingClientRect();
+            const localX = e.clientX - rect.left;
+            const localY = e.clientY - rect.top;
+
+            // Visual update
+            localCursorRef.current.style.transform = `translate(${localX}px, ${localY}px)`;
+
+            // Network broadcast (if needed here, or keep it in canvas interaction)
+            // We can duplicate the network broadcast logic here to show cursor even over UI
+            // But be careful about coordinate systems if 'containerRef' is the canvas container
+            // We should ensure getLocalPoint logic is consistent.
+            // For now, let's just update the VISUAL first as requested.
+        }
+    };
+
     return (
         <div
-            className="relative w-full h-full bg-[#f9f9f9] touch-none overflow-hidden select-none outline-none"
-            style={{ cursor: getCursor() }}
+            className="relative w-full h-full bg-[#f9f9f9] touch-none overflow-hidden select-none outline-none" // select-none added
+            style={{
+                cursor: getCursor(),
+                userSelect: 'none', // Force disable selection
+                WebkitUserSelect: 'none',
+            }}
             onContextMenu={(e) => e.preventDefault()}
+            onPointerMove={handleGlobalPointerMove} // Track mouse globally in this container
         >
             {/* Grid Background */}
             <div
                 className="absolute inset-0 z-0 pointer-events-none opacity-50"
                 style={{
-                    backgroundImage: `radial-gradient(${GRID_SETTINGS.dotColor} ${GRID_SETTINGS.dotSize}px, transparent ${GRID_SETTINGS.dotSize}px)`,
+                    // FIX: Divide dotSize by scale to keep dots Screen-Constant (fixed pixel size)
+                    // relative to the backgroundSize which scales up.
+                    backgroundImage: `radial-gradient(${GRID_SETTINGS.dotColor} ${GRID_SETTINGS.dotSize / scale}px, transparent ${GRID_SETTINGS.dotSize / scale}px)`,
                     backgroundSize: `${GRID_SETTINGS.baseSize * scale}px ${GRID_SETTINGS.baseSize * scale}px`,
                     backgroundPosition: `${panOffset.x}px ${panOffset.y}px`,
                 }}
@@ -662,15 +1207,39 @@ export default function WhiteboardCanvas() {
                 onUndo={performUndo}
                 onRedo={performRedo}
                 onClear={clearBoard}
+                onMouseEnter={() => setIsHoveringToolbar(true)}
+                onMouseLeave={() => setIsHoveringToolbar(false)}
             />
 
             {/* Cursors */}
             <RemoteCursors
                 cursors={remoteCursors}
-                localCursor={localCursor}
+                localCursor={null} // Local cursor is handled separately for performance
                 scale={scale}
                 panOffset={panOffset}
             />
+
+            {/* Local Cursor (Unmanaged Ref for performance) */}
+            <div
+                ref={localCursorRef}
+                className="absolute pointer-events-none z-[60] transition-none will-change-transform top-0 left-0" // top-0 left-0 required for translate
+                style={{
+                    display: 'block', // Always show
+                }}
+            >
+                {/* Only render if we have a participant identity */}
+                {room?.localParticipant && (
+                    <CursorVisual
+                        color={cursorColor}
+                        name={room.localParticipant.name || room.localParticipant.identity}
+                        tool={activeTool}
+                        penColor={activeTool === 'pen' ? penColor : undefined}
+                        isDrawing={isDrawing}
+                        isLocal={true}
+                        showArrow={isHoveringToolbar} // Show arrow ONLY if hovering toolbar (since activeTool is always pen/eraser/hand)
+                    />
+                )}
+            </div>
         </div>
     );
 }

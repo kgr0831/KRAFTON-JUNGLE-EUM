@@ -16,6 +16,7 @@ import ChatPanel, { VoiceRecord } from '@/components/video/ChatPanel';
 import SubtitleOverlay from '@/components/video/SubtitleOverlay';
 import { useRoomTranslation, RoomTranscriptData } from '@/app/hooks/useRoomTranslation';
 import { TargetLanguage } from '@/app/hooks/useAudioWebSocket';
+import ActiveSpeakerOverlay from '@/components/video/ActiveSpeakerOverlay';
 
 const LIVEKIT_URL = process.env.NEXT_PUBLIC_LIVEKIT_URL || 'ws://localhost:7880';
 
@@ -104,64 +105,80 @@ function VideoCallContent({
 
     // STT/번역 결과 처리 (모든 원격 참가자)
     const handleTranscript = useCallback((data: RoomTranscriptData) => {
-        console.log("[VideoCallFeature] Transcript:", data.participantName, "-", data.original, "translated:", data.translated);
+        console.log("[VideoCallFeature] Transcript:", data.participantName, "-", data.original, "isFinal:", data.isFinal, "translated:", data.translated);
 
-        const key = `${data.participantId}-${data.original}`;
+        const speaker = data.participantName || data.participantId;
         const hasTranslation = data.translated && data.translated.length > 0;
 
-        // 번역이 있는 경우: 기존 레코드 업데이트 또는 새로 추가
-        // 번역이 없는 경우: 중복 방지 체크 후 추가
-        if (!hasTranslation && key === lastTranscriptRef.current) {
-            // STT만 있고 이미 처리된 경우 스킵
-            return;
-        }
+        setVoiceRecords(prev => {
+            // 같은 speaker의 마지막 레코드 찾기
+            const lastIndex = prev.findLastIndex(r => r.speaker === speaker);
+            const lastRecord = lastIndex >= 0 ? prev[lastIndex] : null;
 
-        // 번역이 포함된 경우 기존 레코드 업데이트
-        if (hasTranslation) {
-            setVoiceRecords(prev => {
-                // 같은 original을 가진 마지막 레코드 찾기
-                const lastIndex = prev.findLastIndex(r =>
-                    r.speaker === (data.participantName || data.participantId) &&
-                    r.original === data.original
-                );
+            // 번역 모드가 꺼져있으면 번역 표시 안함
+            const showTranslation = isTranslationOpen && hasTranslation;
 
-                if (lastIndex >= 0) {
-                    // 기존 레코드 업데이트
+            // partial 결과 (isFinal === false): 항상 마지막 레코드 업데이트 (없으면 새로 추가)
+            if (!data.isFinal) {
+                // 마지막 레코드가 있고, 아직 isFinal 처리되지 않았으면 업데이트
+                // isFinal 여부는 translated && targetLanguage가 있는 final만 체크
+                const isLastRecordPartial = lastRecord && !lastRecord._isFinal;
+
+                if (isLastRecordPartial) {
                     const updated = [...prev];
                     updated[lastIndex] = {
-                        ...updated[lastIndex],
-                        translated: isTranslationOpen ? data.translated : undefined,
-                        targetLanguage: isTranslationOpen ? targetLanguage : undefined,
+                        ...lastRecord,
+                        original: data.original,
+                        translated: showTranslation ? data.translated : undefined,
+                        sourceLanguage: data.language || lastRecord.sourceLanguage,
+                        targetLanguage: showTranslation ? targetLanguage : undefined,
                     };
                     return updated;
                 }
-
-                // 없으면 새로 추가
+                // 새 partial 레코드 시작
                 return [...prev, {
                     id: `${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
-                    speaker: data.participantName || data.participantId,
+                    speaker,
                     profileImg: data.profileImg,
                     original: data.original,
-                    translated: isTranslationOpen ? data.translated : undefined,
-                    targetLanguage: isTranslationOpen ? targetLanguage : undefined,
+                    translated: showTranslation ? data.translated : undefined,
+                    sourceLanguage: data.language,
+                    targetLanguage: showTranslation ? targetLanguage : undefined,
                     timestamp: Date.now(),
-                }];
-            });
-        } else {
-            // STT만 있는 경우 새 레코드 추가
-            lastTranscriptRef.current = key;
+                    _isFinal: false,
+                } as VoiceRecord];
+            }
 
-            const newRecord: VoiceRecord = {
+            // final 결과 (isFinal === true): 마지막 partial을 업데이트하거나 새로 추가
+            const isLastRecordPartial = lastRecord && !lastRecord._isFinal;
+
+            if (isLastRecordPartial) {
+                // 마지막 레코드가 partial이면 final로 업데이트
+                const updated = [...prev];
+                updated[lastIndex] = {
+                    ...lastRecord,
+                    original: data.original,
+                    translated: isTranslationOpen && hasTranslation ? data.translated : undefined,
+                    sourceLanguage: data.language || lastRecord.sourceLanguage,
+                    targetLanguage: isTranslationOpen && hasTranslation ? targetLanguage : undefined,
+                    _isFinal: true,
+                };
+                return updated;
+            }
+
+            // 새 final 레코드 추가
+            return [...prev, {
                 id: `${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
-                speaker: data.participantName || data.participantId,
+                speaker,
                 profileImg: data.profileImg,
                 original: data.original,
-                translated: undefined,
-                targetLanguage: undefined,
+                translated: isTranslationOpen && hasTranslation ? data.translated : undefined,
+                sourceLanguage: data.language,
+                targetLanguage: isTranslationOpen && hasTranslation ? targetLanguage : undefined,
                 timestamp: Date.now(),
-            };
-            setVoiceRecords(prev => [...prev, newRecord]);
-        }
+                _isFinal: true,
+            } as VoiceRecord];
+        });
 
         // 번역 모드일 때만 자막 표시 (번역이 있을 때)
         if (isTranslationOpen && hasTranslation) {
@@ -184,6 +201,39 @@ function VideoCallContent({
             }, 3000);
         }
     }, [isTranslationOpen, targetLanguage]);
+
+    // 기존 음성 기록 로드 (방 참가 시 Redis에서)
+    useEffect(() => {
+        if (!roomId) return;
+
+        const loadExistingTranscripts = async () => {
+            try {
+                console.log(`[VideoCallFeature] Loading existing transcripts for room: ${roomId}`);
+                const response = await apiClient.getRoomTranscripts(roomId);
+
+                if (response.transcripts && response.transcripts.length > 0) {
+                    const existingRecords: VoiceRecord[] = response.transcripts.map((t) => ({
+                        id: `${t.timestamp}-${t.speakerId}`,
+                        speaker: t.speakerName || t.speakerId,
+                        original: t.original,
+                        translated: t.translated,
+                        sourceLanguage: t.sourceLang,
+                        targetLanguage: t.targetLang,
+                        timestamp: new Date(t.timestamp).getTime(),
+                        _isFinal: t.isFinal,
+                    }));
+
+                    setVoiceRecords(existingRecords);
+                    console.log(`[VideoCallFeature] Loaded ${existingRecords.length} existing transcripts`);
+                }
+            } catch (err) {
+                console.warn('[VideoCallFeature] Failed to load existing transcripts:', err);
+                // 로드 실패해도 계속 진행 (선택적 기능)
+            }
+        };
+
+        loadExistingTranscripts();
+    }, [roomId]);
 
     // Room 기반 단일 WebSocket 번역 훅 (N² → N 연결 최적화)
     // STT는 항상 활성화, TTS는 번역 모드일 때만 재생
@@ -248,9 +298,6 @@ function VideoCallContent({
                             <WhiteboardCanvas />
                         </div>
                     </div>
-                    <div className="w-72 bg-white rounded-2xl overflow-hidden border border-black/10 flex-shrink-0">
-                        <ParticipantSidebar />
-                    </div>
                 </div>
             ) : (
                 <div className="flex-1 overflow-hidden">
@@ -277,9 +324,8 @@ function VideoCallContent({
             )}
 
             {/* 채팅 패널 */}
-            <div className={`fixed top-14 right-0 bottom-0 w-80 z-40 transform transition-transform duration-300 ease-out ${
-                isChatOpen && !isWhiteboardOpen ? 'translate-x-0' : 'translate-x-full'
-            }`}>
+            <div className={`fixed top-14 right-0 bottom-0 w-80 z-40 transform transition-transform duration-300 ease-out ${isChatOpen && !isWhiteboardOpen ? 'translate-x-0' : 'translate-x-full'
+                }`}>
                 <ChatPanel
                     roomId={roomId}
                     onClose={toggleChat}
@@ -296,6 +342,9 @@ function VideoCallContent({
                 isActive={isTranslationActive}
                 showTranslation={isTranslationOpen}
             />
+
+            {/* Active Speaker Bubble (Floating) - Only in Whiteboard Mode */}
+            {isWhiteboardOpen && <ActiveSpeakerOverlay />}
         </>
     );
 }
@@ -372,15 +421,16 @@ export default function VideoCallFeature({ roomId, roomTitle, onLeave }: VideoCa
                     setError(err.message);
                 }}
                 options={{
-                    adaptiveStream: true,
+                    adaptiveStream: { pixelDensity: 'screen' },
                     dynacast: true,
                     disconnectOnPageLeave: true,
                     videoCaptureDefaults: {
-                        resolution: { width: 1280, height: 720, frameRate: 30 },
+                        resolution: { width: 960, height: 540, frameRate: 24 },
                     },
                     publishDefaults: {
                         simulcast: true,
-                        videoCodec: 'vp8',
+                        videoCodec: 'h264',
+                        backupCodec: { codec: 'vp8', encoding: { maxBitrate: 500000 } }
                     },
                 }}
                 className="h-full w-full flex flex-col"

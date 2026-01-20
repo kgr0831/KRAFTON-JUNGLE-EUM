@@ -13,6 +13,7 @@ import (
 	"realtime-backend/internal/model"
 )
 
+// 주석
 var (
 	// 이메일 검증 정규식
 	emailRegex = regexp.MustCompile(`^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$`)

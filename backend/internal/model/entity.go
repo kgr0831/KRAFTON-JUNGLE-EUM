@@ -6,13 +6,19 @@ import (
 
 // User 사용자
 type User struct {
-	ID         int64     `gorm:"primaryKey;autoIncrement" json:"id"`
-	Email      string    `gorm:"type:varchar(255);uniqueIndex;not null" json:"email"`
-	Nickname   string    `gorm:"type:varchar(100);not null" json:"nickname"`
-	ProfileImg *string   `gorm:"type:text" json:"profile_img,omitempty"`
-	Provider   *string   `gorm:"type:varchar(50)" json:"provider,omitempty"`
-	ProviderID *string   `gorm:"type:varchar(255)" json:"provider_id,omitempty"`
-	CreatedAt  time.Time `gorm:"autoCreateTime" json:"created_at"`
+	ID         int64   `gorm:"primaryKey;autoIncrement" json:"id"`
+	Email      string  `gorm:"type:varchar(255);uniqueIndex;not null" json:"email"`
+	Nickname   string  `gorm:"type:varchar(100);not null" json:"nickname"`
+	ProfileImg *string `gorm:"type:text" json:"profile_img,omitempty"`
+	Provider   *string `gorm:"type:varchar(50)" json:"provider,omitempty"`
+	ProviderID *string `gorm:"type:varchar(255)" json:"provider_id,omitempty"`
+
+	// Presence & Status
+	DefaultStatus         string     `gorm:"type:varchar(20);default:'ONLINE'" json:"default_status"`
+	CustomStatusText      *string    `gorm:"type:varchar(100)" json:"custom_status_text,omitempty"`
+	CustomStatusEmoji     *string    `gorm:"type:varchar(10)" json:"custom_status_emoji,omitempty"`
+	CustomStatusExpiresAt *time.Time `json:"custom_status_expires_at,omitempty"`
+	CreatedAt             time.Time  `gorm:"autoCreateTime" json:"created_at"`
 
 	// Relations
 	Workspaces   []WorkspaceMember `gorm:"foreignKey:UserID" json:"workspaces,omitempty"`
@@ -106,12 +112,13 @@ type Meeting struct {
 	CreatedAt   time.Time  `gorm:"autoCreateTime" json:"created_at"`
 
 	// Relations
-	Workspace    *Workspace    `gorm:"foreignKey:WorkspaceID" json:"workspace,omitempty"`
-	Host         User          `gorm:"foreignKey:HostID" json:"host,omitempty"`
-	Participants []Participant `gorm:"foreignKey:MeetingID" json:"participants,omitempty"`
-	Whiteboards  []Whiteboard  `gorm:"foreignKey:MeetingID" json:"whiteboards,omitempty"`
-	ChatLogs     []ChatLog     `gorm:"foreignKey:MeetingID" json:"chat_logs,omitempty"`
-	VoiceRecords []VoiceRecord `gorm:"foreignKey:MeetingID" json:"voice_records,omitempty"`
+	Workspace         *Workspace         `gorm:"foreignKey:WorkspaceID" json:"workspace,omitempty"`
+	Host              User               `gorm:"foreignKey:HostID" json:"host,omitempty"`
+	Participants      []Participant      `gorm:"foreignKey:MeetingID" json:"participants,omitempty"`
+	Whiteboards       []Whiteboard       `gorm:"foreignKey:MeetingID" json:"whiteboards,omitempty"`
+	WhiteboardStrokes []WhiteboardStroke `gorm:"foreignKey:MeetingID" json:"whiteboard_strokes,omitempty"`
+	ChatLogs          []ChatLog          `gorm:"foreignKey:MeetingID" json:"chat_logs,omitempty"`
+	VoiceRecords      []VoiceRecord      `gorm:"foreignKey:MeetingID" json:"voice_records,omitempty"`
 }
 
 func (Meeting) TableName() string {
@@ -120,12 +127,13 @@ func (Meeting) TableName() string {
 
 // Participant 회의 참가자
 type Participant struct {
-	ID        int64      `gorm:"primaryKey;autoIncrement" json:"id"`
-	MeetingID int64      `gorm:"not null" json:"meeting_id"`
-	UserID    *int64     `json:"user_id,omitempty"`                     // 비회원 허용
-	Role      string     `gorm:"type:varchar(20);not null" json:"role"` // HOST, PRESENTER, GUEST
-	JoinedAt  time.Time  `gorm:"autoCreateTime" json:"joined_at"`
-	LeftAt    *time.Time `json:"left_at,omitempty"`
+	ID         int64      `gorm:"primaryKey;autoIncrement" json:"id"`
+	MeetingID  int64      `gorm:"not null" json:"meeting_id"`
+	UserID     *int64     `json:"user_id,omitempty"`                     // 비회원 허용
+	Role       string     `gorm:"type:varchar(20);not null" json:"role"` // HOST, PRESENTER, GUEST
+	JoinedAt   time.Time  `gorm:"autoCreateTime" json:"joined_at"`
+	LeftAt     *time.Time `json:"left_at,omitempty"`
+	LastReadAt *time.Time `json:"last_read_at,omitempty"` // 마지막으로 읽은 시간 (DM unread count용)
 
 	// Relations
 	Meeting Meeting `gorm:"foreignKey:MeetingID" json:"meeting,omitempty"`
@@ -178,8 +186,9 @@ type VoiceRecord struct {
 	MeetingID     int64     `gorm:"not null;index" json:"meeting_id"`
 	SpeakerID     *int64    `json:"speaker_id,omitempty"`
 	SpeakerName   string    `gorm:"type:varchar(100)" json:"speaker_name"`
-	Original      string    `gorm:"type:text;not null" json:"original"`       // STT 원본 텍스트
-	Translated    *string   `gorm:"type:text" json:"translated,omitempty"`    // 번역된 텍스트 (있는 경우)
+	Original      string    `gorm:"type:text;not null" json:"original"`            // STT 원본 텍스트
+	Translated    *string   `gorm:"type:text" json:"translated,omitempty"`         // 번역된 텍스트 (있는 경우)
+	SourceLang    *string   `gorm:"type:varchar(10)" json:"source_lang,omitempty"` // 원본 언어 (ko, en, ja, zh)
 	TargetLang    *string   `gorm:"type:varchar(10)" json:"target_lang,omitempty"` // 번역 대상 언어
 	CreatedAt     time.Time `gorm:"autoCreateTime;index" json:"created_at"`
 
@@ -258,4 +267,40 @@ type WorkspaceFile struct {
 
 func (WorkspaceFile) TableName() string {
 	return "workspace_files"
+}
+
+// WorkspaceCategory 워크스페이스 카테고리 (사용자별)
+type WorkspaceCategory struct {
+	ID        int64     `gorm:"primaryKey;autoIncrement" json:"id"`
+	UserID    int64     `gorm:"not null" json:"user_id"`
+	Name      string    `gorm:"type:varchar(100);not null" json:"name"`
+	Color     string    `gorm:"type:varchar(20);default:'#6366f1'" json:"color"`
+	SortOrder int       `gorm:"default:0" json:"sort_order"`
+	CreatedAt time.Time `gorm:"autoCreateTime" json:"created_at"`
+
+	// Relations
+	User     User                        `gorm:"foreignKey:UserID" json:"user,omitempty"`
+	Mappings []WorkspaceCategoryMapping `gorm:"foreignKey:CategoryID" json:"mappings,omitempty"`
+}
+
+func (WorkspaceCategory) TableName() string {
+	return "workspace_categories"
+}
+
+// WorkspaceCategoryMapping 워크스페이스-카테고리 매핑
+type WorkspaceCategoryMapping struct {
+	ID          int64     `gorm:"primaryKey;autoIncrement" json:"id"`
+	CategoryID  int64     `gorm:"not null" json:"category_id"`
+	WorkspaceID int64     `gorm:"not null" json:"workspace_id"`
+	UserID      int64     `gorm:"not null" json:"user_id"`
+	CreatedAt   time.Time `gorm:"autoCreateTime" json:"created_at"`
+
+	// Relations
+	Category  WorkspaceCategory `gorm:"foreignKey:CategoryID" json:"category,omitempty"`
+	Workspace Workspace         `gorm:"foreignKey:WorkspaceID" json:"workspace,omitempty"`
+	User      User              `gorm:"foreignKey:UserID" json:"user,omitempty"`
+}
+
+func (WorkspaceCategoryMapping) TableName() string {
+	return "workspace_category_mappings"
 }
